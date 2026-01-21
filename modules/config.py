@@ -19,11 +19,11 @@ MAP_BOUNDS = {
 
 # 3D 설정 (NEW)
 ENABLE_3D = True  # 3D 모드 활성화
-ALTITUDE_LEVELS = 50  # 고도 레벨 수
+ALTITUDE_LEVELS = 5  # 고도 레벨 수
 ALTITUDE_MIN = 0  # 최소 고도 (m)
 ALTITUDE_MAX = 5000  # 최대 고도 (m)
 TERRAIN_FOLLOWING = True  # 지형 추종 모드
-MIN_ALTITUDE_AGL = 100  # 최소 지상고도 (m, Above Ground Level)
+MIN_ALTITUDE_AGL = 250  # 최소 지상고도 (m, Above Ground Level)
 
 # SRTM 데이터 경로
 SRTM_DATA_DIR = "data/elevation"
