@@ -445,18 +445,33 @@ with col_right:
 
     threats_dict = [t.to_dict() for t in mission.threats]
 
-    # ── 자산별 경로 색상 팔레트 ──
-    # 임무 유형별 색상 (교리 색상 체계 반영)
+    # ── 자산별 경로 색상 팔레트 (고대비 6색 팔레트) ──
+    # 각 자산이 지도 위에서 명확히 구분되도록 색상 최대 차별화
+    # 색맹 친화적(Color-blind safe) + 흰 외곽선으로 배경 대비 보장
+    # ── 자산별 경로 색상 팔레트 (완전 고대비 8색, 색맹 친화적) ──
+    # 인접 자산끼리 절대 유사한 색이 나오지 않도록 최대 색조 간격 보장
+    ASSET_PALETTE = [
+        "#E53935",  # 1번: 선명한 빨강    ─ Eagle-1 (전투기)
+        "#43A047",  # 2번: 선명한 초록    ─ Scout-1 (정찰UAV)
+        "#FB8C00",  # 3번: 선명한 주황    ─ Scout-2 (정찰UAV)
+        "#8E24AA",  # 4번: 선명한 보라    ─ Scout-3 (정찰UAV)
+        "#F9A825",  # 5번: 황금노랑       ─ Scout-4 (정찰UAV)
+        "#00897B",  # 6번: 짙은 틸        ─ Viper-1 (자폭UAV)
+        "#D81B60",  # 7번: 진홍분홍       ─ Viper-2 (자폭UAV)
+        "#1565C0",  # 8번: 짙은 파랑      ─ 추가 자산
+    ]
+    # 임무 유형 기본 색상 (편대 없을 때 단일 경로)
     MISSION_COLOR = {
-        "ISR":    "#2196F3",  # 파랑 - 정찰
-        "SEAD":   "#FF9800",  # 주황 - 방공제압
-        "STRIKE": "#F44336",  # 빨강 - 타격
-        "CAS":    "#4CAF50",  # 초록 - 근접지원
+        "ISR":    "#43A047",  # 초록 (정찰)
+        "SEAD":   "#FB8C00",  # 주황 (전자전)
+        "STRIKE": "#E53935",  # 빨강 (타격)
+        "CAS":    "#F9A825",  # 황금 (근접지원)
     }
+    # 자산 타입별 색상 (편대 없을 때 사용)
     ASSET_COLOR = {
-        "fighter":    "#E91E63",  # 핫핑크 - 전투기
-        "recon_uav":  "#2196F3",  # 파랑 - 정찰UAV
-        "attack_uav": "#FF5722",  # 딥오렌지 - 자폭UAV
+        "fighter":    "#E53935",  # 빨강   ─ 전투기
+        "recon_uav":  "#43A047",  # 초록   ─ 정찰UAV (파랑과 구분)
+        "attack_uav": "#00897B",  # 틸     ─ 자폭UAV
     }
 
     # ── 경로 계산 ──
@@ -491,7 +506,8 @@ with col_right:
                 else:
                     raw = pathfinder.find_path(a_start[:2], a_target[:2], threats_dict, mission.params.margin)
                 path_in = smooth_path_3d(raw) if (raw and len(raw[0]) == 3) else smooth_path(raw)
-            except Exception:
+            except Exception as e:
+                st.warning(f"⚠️ {asset.callsign} 경로 탐색 오류: {e}")
                 path_in = []
 
             path_out = []
@@ -506,10 +522,13 @@ with col_right:
                     else:
                         raw_o = pathfinder.find_path(eg_start[:2], eg_end[:2], threats_dict, mission.params.margin)
                     path_out = smooth_path_3d(raw_o) if (raw_o and len(raw_o[0]) == 3) else smooth_path(raw_o)
-                except Exception:
+                except Exception as e2:
+                    st.warning(f"⚠️ {asset.callsign} 복귀 경로 오류: {e2}")
                     path_out = []
 
-            color = MISSION_COLOR.get(asset.assigned_mission, ASSET_COLOR.get(asset.asset_type, "#607D8B"))
+            # 자산 인덱스 기반 팔레트 색상 (자산마다 완전히 다른 색)
+            asset_idx = list(mission.formation.assets).index(asset)
+            color = ASSET_PALETTE[asset_idx % len(ASSET_PALETTE)]
             formation_paths[asset.asset_id] = {
                 "in": path_in, "out": path_out,
                 "color": color, "callsign": asset.callsign,
@@ -530,63 +549,146 @@ with col_right:
 
     else:
         # 편대 없으면 기존 단일 경로
-        if mission.params.algorithm == "A* 3D":
-            raw_in = pathfinder.find_path_3d_fast(start_coord, target_coord, threats_dict, mission.params.margin)
-        elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
-            raw_in = pathfinder.find_path_3d(start_coord, target_coord, threats_dict, mission.params.margin)
-        else:
-            raw_in = pathfinder.find_path(start_coord[:2], target_coord[:2], threats_dict, mission.params.margin)
+        try:
+            if mission.params.algorithm == "A* 3D":
+                raw_in = pathfinder.find_path_3d_fast(start_coord, target_coord, threats_dict, mission.params.margin)
+            elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
+                raw_in = pathfinder.find_path_3d(start_coord, target_coord, threats_dict, mission.params.margin)
+            else:
+                raw_in = pathfinder.find_path(start_coord[:2], target_coord[:2], threats_dict, mission.params.margin)
+        except Exception as e:
+            st.warning(f"⚠️ 단일 경로 탐색 오류: {e}")
+            raw_in = []
         final_in = smooth_path_3d(raw_in) if (raw_in and len(raw_in[0]) == 3) else smooth_path(raw_in)
 
         if mission.params.rtb and final_in:
             eg_s = final_in[-1]
             eg_e = start_coord
-            if mission.params.algorithm == "A* 3D":
-                raw_out = pathfinder.find_path_3d_fast(eg_s, eg_e, threats_dict, mission.params.margin)
-            elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
-                raw_out = pathfinder.find_path_3d(eg_s, eg_e, threats_dict, mission.params.margin)
-            else:
-                raw_out = pathfinder.find_path(eg_s[:2], eg_e[:2], threats_dict, mission.params.margin)
+            try:
+                if mission.params.algorithm == "A* 3D":
+                    raw_out = pathfinder.find_path_3d_fast(eg_s, eg_e, threats_dict, mission.params.margin)
+                elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
+                    raw_out = pathfinder.find_path_3d(eg_s, eg_e, threats_dict, mission.params.margin)
+                else:
+                    raw_out = pathfinder.find_path(eg_s[:2], eg_e[:2], threats_dict, mission.params.margin)
+            except Exception as e3:
+                st.warning(f"⚠️ 복귀 경로 오류: {e3}")
+                raw_out = []
             final_out = smooth_path_3d(raw_out) if (raw_out and len(raw_out[0]) == 3) else smooth_path(raw_out)
 
     calc_time = time.time() - start_time
     st.session_state.current_path = final_in
     st.caption(f"⏱️ 계산 시간: {calc_time:.3f}초")
 
-    # ===== 지도 시각화 (개선 v2.0) =====
+    # 경로 생성 실패 진단
+    if formation_paths:
+        failed = [aid for aid, d in formation_paths.items() if not d["in"]]
+        ok     = [aid for aid, d in formation_paths.items() if d["in"]]
+        if failed:
+            st.warning(
+                f"⚠️ 경로 탐색 부분 실패: {', '.join(failed)}\n\n"
+                "**원인 및 해결책:**\n"
+                "- 위협(RADAR 80km) 반경이 경로를 모두 차단할 수 있음\n"
+                "- **안전 마진을 줄이거나(예: 2km)** A* 3D 알고리즘 선택 시 저고도 우회 자동 적용\n"
+                "- 위협 반경을 줄이거나 위협을 삭제한 후 재시도"
+            )
+        if ok:
+            st.success(f"✅ 경로 탐색 성공: {', '.join(ok)} ({len(ok)}/{len(formation_paths)} 자산)")
+    elif not final_in and mission.threats:
+        st.warning(
+            "⚠️ 경로 탐색 실패\n\n"
+            "위협 반경이 모든 경로를 차단 중입니다. "
+            "안전 마진을 줄이거나(사이드바 슬라이더), "
+            "위협을 일부 삭제한 후 재시도하세요.\n"
+            "A* 3D 알고리즘 선택 시 저고도 우회를 자동 시도합니다."
+        )
+
+    # ===== 지도 시각화 v3.0 - 레이어 순서 완전 재설계 =====
+    # 렌더링 순서 (아래→위): 히트맵 → 위협원(채움) → 위협원(테두리) → 경로선 → 마커
+    # Folium은 나중에 add_to()한 요소가 위에 표시됨
     m = folium.Map(
         location=MAP_CENTER, zoom_start=MAP_ZOOM,
         tiles="CartoDB positron"  # 밝은 배경 → 경로 가시성 향상
     )
 
-    # ── [Layer 1] 히트맵 (가장 아래) ──
-    if 'show_heatmap' in locals() and show_heatmap and mission.threats:
+    # ── [Layer 1] 히트맵 (가장 아래, 경로를 절대 가리지 않도록) ──
+    show_heatmap = st.session_state.get('_show_heatmap', True)
+    if show_heatmap and mission.threats:
         h_data = XAIUtils.generate_heatmap_data(threats_dict, mission.params.margin, terrain_loader=terrain_fast)
         if h_data:
-            HeatMap(h_data, radius=15, blur=20, min_opacity=0.15, max_opacity=0.5).add_to(m)
+            HeatMap(h_data, radius=15, blur=25, min_opacity=0.1, max_opacity=0.35).add_to(m)
 
-    # ── [Layer 2] 위협 영역 (반투명, fill_opacity 낮춰서 경로가 보이게) ──
+    # ── [Layer 2] 위협 영역 채움 (아주 연하게, 경로보다 먼저 그림) ──
+    t_color_map = {"SAM": ("#D32F2F", "red"), "RADAR": ("#6A1B9A", "purple"), "NFZ": ("#E65100", "orange")}
     for t in mission.threats:
-        t_color_map = {"SAM": ("#D32F2F", "red"), "RADAR": ("#6A1B9A", "purple"), "NFZ": ("#E65100", "orange")}
         hex_color, icon_color = t_color_map.get(t.type, ("#607D8B", "gray"))
         if t.type == "NFZ":
             folium.Rectangle(
                 [[t.lat_min, t.lon_min], [t.lat_max, t.lon_max]],
-                color=hex_color, weight=2,
-                fill=True, fill_color=hex_color, fill_opacity=0.1
+                color=hex_color, weight=1.5,
+                fill=True, fill_color=hex_color, fill_opacity=0.07
             ).add_to(m)
         elif t.lat and t.lon:
-            # 위협 원: fill_opacity 낮춰서 경로가 위에 보이게
             folium.Circle(
                 [t.lat, t.lon], radius=t.radius_km * 1000,
-                color=hex_color, weight=2,
-                fill=True, fill_color=hex_color, fill_opacity=0.08  # 0.2 → 0.08
+                color=hex_color, weight=1.5, opacity=0.5,
+                fill=True, fill_color=hex_color, fill_opacity=0.06
             ).add_to(m)
-            # 테두리 강조용 외곽선 (점선)
+
+    # ── [Layer 3] 경로선 (위협원보다 위에, 두껍게) ──
+    def draw_path_with_outline(path_coords, color, weight=6, opacity=0.97, dash="", tooltip_text=""):
+        """경로를 흰 외곽선 + 색상 선으로 그려 어떤 배경에서도 선명하게 표시"""
+        if not path_coords:
+            return
+        latlon = [(p[0], p[1]) for p in path_coords]
+        # Step 1: 검은 그림자 선 (가장 두껍게, 가장 아래)
+        folium.PolyLine(
+            latlon, color="#111111", weight=weight + 5,
+            opacity=0.4, tooltip=tooltip_text
+        ).add_to(m)
+        # Step 2: 흰색 외곽선 (중간 두께)
+        folium.PolyLine(
+            latlon, color="white", weight=weight + 2,
+            opacity=0.9, tooltip=tooltip_text
+        ).add_to(m)
+        # Step 3: 실제 색상 선 (가장 위)
+        kwargs = dict(color=color, weight=weight, opacity=opacity, tooltip=tooltip_text)
+        if dash:
+            kwargs["dash_array"] = dash
+        folium.PolyLine(latlon, **kwargs).add_to(m)
+
+    type_icon_map = {"fighter": "✈", "recon_uav": "👁", "attack_uav": "💥"}
+
+    if formation_paths:
+        for asset_id, pdata in formation_paths.items():
+            clr   = pdata["color"]
+            label = f"{type_icon_map.get(pdata['type'],'?')} {pdata['callsign']} [{pdata['mission']}]"
+
+            if pdata["in"]:
+                draw_path_with_outline(
+                    pdata["in"], clr, weight=6, opacity=0.97,
+                    tooltip_text=f"{label} ▶ Ingress"
+                )
+            if pdata["out"]:
+                draw_path_with_outline(
+                    pdata["out"], clr, weight=4, opacity=0.80,
+                    dash="10 6",
+                    tooltip_text=f"{label} ◀ Egress"
+                )
+    else:
+        if final_in:
+            draw_path_with_outline(final_in, "#E53935", weight=6, opacity=0.97, tooltip_text="Ingress")
+        if final_out:
+            draw_path_with_outline(final_out, "#1E88E5", weight=5, opacity=0.85, dash="10 6", tooltip_text="Egress")
+
+    # ── [Layer 4] 위협 테두리 + 아이콘 (경로 위에 그리되 얇게) ──
+    for t in mission.threats:
+        hex_color, icon_color = t_color_map.get(t.type, ("#607D8B", "gray"))
+        if t.type != "NFZ" and t.lat and t.lon:
             folium.Circle(
                 [t.lat, t.lon], radius=t.radius_km * 1000,
-                color=hex_color, weight=2.5, opacity=0.7,
-                fill=False, dash_array="8 4"
+                color=hex_color, weight=2.5, opacity=0.8,
+                fill=False, dash_array="10 5"
             ).add_to(m)
             icon_name = "rocket" if t.type == "SAM" else "wifi"
             folium.Marker(
@@ -595,71 +697,21 @@ with col_right:
                 tooltip=f"{t.type}: {t.name} (반경 {t.radius_km:.0f}km)"
             ).add_to(m)
 
-    # ── [Layer 3] 경로선 (두껍게, 경계선 효과로 가시성 극대화) ──
-    PATH_WEIGHT_INGRESS  = 6   # ingress 굵기 (기존 3 → 6)
-    PATH_WEIGHT_EGRESS   = 4   # egress 굵기  (기존 2 → 4)
-    PATH_OUTLINE_WEIGHT  = 9   # 외곽선 굵기 (경로 위에 그리는 흰 외곽선)
-
-    def draw_path_with_outline(path_coords, color, weight, opacity, dash="", tooltip_text=""):
-        """경로를 흰 외곽선 + 색상 내부선으로 그려 가시성 극대화"""
-        if not path_coords:
-            return
-        latlon = [(p[0], p[1]) for p in path_coords]
-        # 흰색 외곽선 (배경)
-        folium.PolyLine(
-            latlon, color="white", weight=weight + 3,
-            opacity=min(opacity + 0.2, 1.0), tooltip=tooltip_text
-        ).add_to(m)
-        # 실제 색상 선
-        kwargs = dict(color=color, weight=weight, opacity=opacity, tooltip=tooltip_text)
-        if dash:
-            kwargs["dash_array"] = dash
-        folium.PolyLine(latlon, **kwargs).add_to(m)
-
+    # ── [Layer 5] 경로 위에 자산 마커 (출발점 원) ──
     if formation_paths:
-        type_icon_map = {"fighter": "✈", "recon_uav": "👁", "attack_uav": "💥"}
         for asset_id, pdata in formation_paths.items():
-            clr   = pdata["color"]
+            clr = pdata["color"]
             label = f"{type_icon_map.get(pdata['type'],'?')} {pdata['callsign']} [{pdata['mission']}]"
-
-            # Ingress: 굵은 실선 + 흰 외곽선
             if pdata["in"]:
-                draw_path_with_outline(
-                    pdata["in"], clr,
-                    weight=PATH_WEIGHT_INGRESS, opacity=0.95,
-                    tooltip_text=f"{label} ▶ Ingress"
-                )
-                # 출발점 원형 마커 (크게)
+                # 출발 마커
                 folium.CircleMarker(
-                    pdata["in"][0][:2], radius=7,
-                    color="white", weight=2,
-                    fill=True, fill_color=clr, fill_opacity=0.95,
+                    pdata["in"][0][:2], radius=8,
+                    color="white", weight=2.5,
+                    fill=True, fill_color=clr, fill_opacity=1.0,
                     tooltip=label
                 ).add_to(m)
-                # 목표점 도착 마커
-                folium.CircleMarker(
-                    pdata["in"][-1][:2], radius=6,
-                    color=clr, weight=2,
-                    fill=True, fill_color="white", fill_opacity=0.9,
-                    tooltip=f"{label} 도착"
-                ).add_to(m)
 
-            # Egress: 점선 + 흰 외곽선
-            if pdata["out"]:
-                draw_path_with_outline(
-                    pdata["out"], clr,
-                    weight=PATH_WEIGHT_EGRESS, opacity=0.75,
-                    dash="8 5",
-                    tooltip_text=f"{label} ◀ Egress"
-                )
-    else:
-        # 단일 경로 (기존) - 역시 두껍게
-        if final_in:
-            draw_path_with_outline(final_in, "#1565C0", weight=6, opacity=0.95, tooltip_text="Ingress")
-        if final_out:
-            draw_path_with_outline(final_out, "#E65100", weight=5, opacity=0.85, dash="8 5", tooltip_text="Egress")
-
-    # ── [Layer 4] 출발·목표 마커 (경로 위에) ──
+    # ── [Layer 6] 출발·목표 마커 (최상위) ──
     folium.Marker(
         start_coord[:2],
         icon=folium.Icon(color="blue", icon="plane", prefix="fa"),
@@ -674,28 +726,29 @@ with col_right:
     # ── 범례 (편대 구성 시) ──
     if formation_paths:
         type_icon_map2 = {"fighter": "✈", "recon_uav": "🔍", "attack_uav": "💥"}
-        legend_html = (
-            "<div style='background:rgba(15,15,25,0.88);color:white;"
-            "padding:10px 14px;border-radius:8px;font-size:12px;"
-            "border:1px solid rgba(255,255,255,0.2);min-width:180px;'>"
-            "<b style='font-size:13px;'>📍 자산 경로 범례</b><br><hr style='margin:4px 0;opacity:0.3;'>"
-        )
+        legend_rows = ""
         for asset_id, pdata in formation_paths.items():
             icon_c = type_icon_map2.get(pdata["type"], "?")
-            # Ingress: 실선, Egress: 점선
-            legend_html += (
-                f"<div style='margin:3px 0;'>"
-                f"<span style='display:inline-block;width:28px;height:4px;"
-                f"background:{pdata['color']};border-radius:2px;vertical-align:middle;margin-right:6px;'></span>"
-                f"{icon_c} {pdata['callsign']} "
-                f"<span style='color:#aaa;font-size:11px;'>[{pdata['mission']}]</span></div>"
+            legend_rows += (
+                f"<div style='display:flex;align-items:center;margin:4px 0;gap:8px;'>"
+                f"<div style='width:32px;height:5px;background:{pdata['color']};"
+                f"border:1px solid white;border-radius:3px;flex-shrink:0;'></div>"
+                f"<span>{icon_c} <b>{pdata['callsign']}</b> "
+                f"<span style='color:#ccc;font-size:11px;'>[{pdata['mission']}]</span></span>"
+                f"</div>"
             )
-        if mission.params.rtb:
-            legend_html += (
-                "<div style='margin-top:6px;color:#aaa;font-size:10px;'>"
-                "실선: Ingress &nbsp;┆&nbsp; 점선: Egress</div>"
-            )
-        legend_html += "</div>"
+        rtb_note = (
+            "<div style='margin-top:8px;padding-top:6px;border-top:1px solid rgba(255,255,255,0.2);"
+            "color:#aaa;font-size:10px;'>실선 ─ Ingress &nbsp;│&nbsp; 점선 ╌ Egress</div>"
+        ) if mission.params.rtb else ""
+        legend_html = (
+            f"<div style='background:rgba(10,10,20,0.90);color:white;"
+            f"padding:12px 16px;border-radius:10px;font-size:12px;"
+            f"border:1px solid rgba(255,255,255,0.15);min-width:190px;"
+            f"box-shadow:0 4px 12px rgba(0,0,0,0.5);'>"
+            f"<div style='font-size:13px;font-weight:bold;margin-bottom:6px;'>📍 자산 경로 범례</div>"
+            f"{legend_rows}{rtb_note}</div>"
+        )
         m.get_root().html.add_child(folium.Element(
             f"<div style='position:fixed;bottom:40px;left:40px;z-index:9999;'>{legend_html}</div>"
         ))
