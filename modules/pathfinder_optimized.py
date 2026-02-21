@@ -128,30 +128,44 @@ class AStarPathfinder3DOptimized:
 
     # --- 충돌 검사 ---
     def is_collision_3d(self, lat, lon, alt, threats, margin):
-        # [주의] pathfinder.py의 로직과 동일하게 유지해야 함 (여기서는 간소화 버전)
+        """
+        3D 위협 충돌 검사:
+        - SAM: 반경 + 마진 이내 AND 충분히 높으면 충돌 (저고도 침투로 회피 가능)
+        - RADAR: 반경 + 마진 이내이지만 저고도(AGL < LOW_ALT_THRESHOLD)면 회피
+        - NFZ: 항상 충돌
+        """
         margin_deg = margin / LAT_TO_KM
+        # 저고도 회피 임계값: RADAR는 400m AGL 이하면 레이더 음영 (SAM은 더 낮은 200m)
+        RADAR_SHADOW_AGL = 400.0  # RADAR 회피 최대 고도
+        SAM_SHADOW_AGL   = 200.0  # SAM 회피 최대 고도 (거의 초저공)
+
+        try:
+            elev = self.terrain.get(lat, lon)
+        except Exception:
+            elev = 0.0
+        agl = alt - elev
+
         for t in threats:
-            if t["type"] in ["SAM", "RADAR"]:
+            t_type = t.get("type", "")
+            if t_type in ("SAM", "RADAR"):
                 dist_km = math.sqrt(
                     ((lat - t["lat"]) * LAT_TO_KM) ** 2
                     + ((lon - t["lon"]) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
                 )
-                
-                # 간단한 거리 체크
-                if dist_km < (t["radius_km"] + margin):
-                    # 저고도 침투 로직 (300m 이하 안전)
-                    try:
-                        elev = self.terrain.get(lat, lon)
-                        agl = alt - elev
-                    except:
-                        agl = 1000
-                    
-                    if agl < 300: # 지형 은폐
-                        continue
-                        
-                    return True # 충돌
-                    
-            elif t["type"] == "NFZ":
+                effective_r = t["radius_km"] + margin
+                if dist_km < effective_r:
+                    # RADAR: 저고도 침투 허용 (레이더 음영 활용)
+                    if t_type == "RADAR":
+                        if agl < RADAR_SHADOW_AGL:
+                            continue  # 저고도 → 충돌 아님
+                        return True  # 고고도는 충돌
+                    # SAM: 매우 낮은 고도에서만 회피
+                    else:  # SAM
+                        if agl < SAM_SHADOW_AGL:
+                            continue  # 초저공 회피
+                        return True  # 일반 고도는 충돌
+
+            elif t_type == "NFZ":
                 if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
                     (t["lon_min"] - margin_deg <= lon <= t["lon_max"] + margin_deg)):
                     return True
@@ -177,16 +191,27 @@ class AStarPathfinder3DOptimized:
         directions = [(dx, dy, dz) for dx in [-1,0,1] for dy in [-1,0,1] for dz in [-1,0,1] if not (dx==dy==dz==0)]
 
         nodes_explored = 0
+        best_dist = float('inf')  # 탐색 중 목표에 가장 가까운 노드
+        best_node = start_grid
+
         while open_set:
             current = heapq.heappop(open_set)[1]
             nodes_explored += 1
             
-            # 근접 도달 허용 (Grid 단위 2칸 이내)
-            if self.distance(current, end_grid) < 2:
+            # 목표까지 거리
+            d = self.distance(current, end_grid)
+            if d < best_dist:
+                best_dist = d
+                best_node = current
+
+            # 근접 도달 허용 (Grid 단위 3칸 이내로 완화)
+            if d < 3:
                 return self.reconstruct(came_from, current)
 
-            if nodes_explored > 50000:
-                print("⚠️ 탐색 제한 초과 (50k nodes)")
+            if nodes_explored > 100000:  # 탐색 한도 100k로 확장
+                print(f"⚠️ 탐색 제한 초과 (100k nodes), 최근접 노드 반환")
+                # 탐색 실패 시 지금까지 가장 가까이 간 경로 반환 (부분 경로)
+                return self.reconstruct(came_from, best_node)
                 break
 
             for dx, dy, dz in directions:
@@ -219,5 +244,9 @@ class AStarPathfinder3DOptimized:
                     f = tentative_g + self.heuristic(neighbor, end_grid)
                     heapq.heappush(open_set, (f, neighbor))
 
+        # open_set 소진 → 지금까지 가장 가까운 노드까지의 부분 경로 반환
+        if best_node != start_grid and best_node in came_from:
+            print(f"⚠️ 경로 탐색 부분 성공 (목표거리: {best_dist:.1f} 그리드)")
+            return self.reconstruct(came_from, best_node)
         print("❌ 경로 탐색 실패")
         return []
