@@ -1,9 +1,8 @@
 """
-통합 임무계획 시스템 v12.0 (MUM-T + Rule-based Validator)
-- LLM Brain v2.0: qwen3:14b 군사 전문 참모 AI
-- Formation Optimizer: MILP + 헝가리안 편대 구성
-- Mission Validator: 규칙 기반 7개 항목 검증 (교리 기반)
-- 교리 기반: JP3-30, AFDP3-03, FMI3-04.155, DAFMAN11-260
+통합 임무계획 시스템 v13.0 (MUM-T + Rule-based Validator)
+- LLM Brain v2.1: UI 실시간 동기화 + 응답 캐싱 + 빠른 모델 자동 선택
+- 경로탐색 v2.0: 위협 존재 시 저고도 우회 (RADAR 400m/SAM 200m AGL)
+- 자산 색상 고대비 8색 팔레트 (색맹 친화적)
 """
 import streamlit as st
 import folium
@@ -24,8 +23,8 @@ from modules.terrain_loader import TerrainLoader
 from modules.xai_utils import XAIUtils
 
 # ===== 페이지 설정 =====
-st.set_page_config(page_title="IMPS v12.0 (MUM-T)", layout="wide", initial_sidebar_state="collapsed")
-st.title("🚁 통합 임무계획 시스템 v12.0 (MUM-T + Validator)")
+st.set_page_config(page_title="IMPS v13.0 (MUM-T)", layout="wide", initial_sidebar_state="collapsed")
+st.title("🚁 통합 임무계획 시스템 v13.0 (MUM-T + Validator)")
 
 # ===== 상태 초기화 =====
 if "mission" not in st.session_state:
@@ -55,24 +54,43 @@ with col_left:
     # 1. 작전 통제
     with tab_ops:
         with st.expander("⚙️ 미션 프로파일 설정", expanded=True):
-            with st.form("mission_form"):
-                p = mission.params
-                p.start = st.selectbox("출발 기지", list(AIRPORTS.keys()), index=list(AIRPORTS.keys()).index(p.start))
-                
-                c1, c2 = st.columns(2)
-                p.target_lat = c1.number_input("Lat", 33.0, 43.0, p.target_lat, format="%.4f")
-                p.target_lon = c2.number_input("Lon", 124.0, 132.0, p.target_lon, format="%.4f")
+            p = mission.params
 
-                c_rtb, c_algo = st.columns([1, 1])
-                p.rtb = c_rtb.checkbox("Strike & RTB", value=p.rtb)
-                p.algorithm = c_algo.selectbox("알고리즘", AVAILABLE_ALGORITHMS, index=AVAILABLE_ALGORITHMS.index(p.algorithm))
+            # ── session_state 키 강제 동기화 (LLM 업데이트 반영) ──
+            # LLM이 mission.params를 바꾼 뒤 st.rerun() 하면
+            # 아래 session_state 키들이 이미 새 값으로 설정되어 위젯에 즉시 반영됨
+            # ── session_state 초기값 설정 (최초 1회만, 이미 있으면 LLM 값 유지) ──
+            # key= 위젯은 session_state 값을 그대로 표시하므로
+            # 처음 렌더링 전에만 params 값으로 초기화하고, 이후는 건드리지 않음
+            # LLM 업데이트 시에는 _set() 함수로 session_state를 직접 덮어씀
+            _defaults = {
+                "_mp_start":      p.start,
+                "_mp_target_lat": p.target_lat,
+                "_mp_target_lon": p.target_lon,
+                "_mp_rtb":        p.rtb,
+                "_mp_algorithm":  p.algorithm,
+                "_mp_enable_3d":  p.enable_3d,
+                "_mp_margin":     float(p.margin),
+                "_mp_stpt_gap":   int(p.stpt_gap),
+            }
+            for _k, _v in _defaults.items():
+                if _k not in st.session_state:
+                    st.session_state[_k] = _v  # 최초 1회만 설정
 
-                p.enable_3d = st.checkbox("3D 모드 (지형 고려)", value=p.enable_3d)
-                p.margin = st.slider("안전 마진(km)", 0.0, 50.0, p.margin)
-                p.stpt_gap = st.slider("STPT 표시 간격", 1, 50, p.stpt_gap)
+            # ── 위젯: key= 만 사용, index=/value= 제거 → session_state 값이 곧 표시값 ──
+            p.start = st.selectbox("출발 기지", list(AIRPORTS.keys()), key="_mp_start")
+            c1, c2 = st.columns(2)
+            p.target_lat = c1.number_input("Lat", 33.0, 43.0, step=0.0001, format="%.4f", key="_mp_target_lat")
+            p.target_lon = c2.number_input("Lon", 124.0, 132.0, step=0.0001, format="%.4f", key="_mp_target_lon")
+            c_rtb, c_algo = st.columns([1, 1])
+            p.rtb       = c_rtb.checkbox("Strike & RTB", key="_mp_rtb")
+            p.algorithm = c_algo.selectbox("알고리즘", AVAILABLE_ALGORITHMS, key="_mp_algorithm")
+            p.enable_3d = st.checkbox("3D 모드 (지형 고려)", key="_mp_enable_3d")
+            p.margin    = st.slider("안전 마진(km)", 0.0, 50.0, key="_mp_margin")
+            p.stpt_gap  = st.slider("STPT 표시 간격", 1, 50, key="_mp_stpt_gap")
 
-                if st.form_submit_button("🔄 설정 적용 및 경로 계산", type="primary"):
-                    st.rerun()
+            if st.button("🔄 설정 적용 및 경로 계산", type="primary", use_container_width=True):
+                st.rerun()
 
         st.divider()
         chat_container = st.container(height=CHAT_CONTAINER_HEIGHT)
@@ -91,27 +109,33 @@ with col_left:
                 u = result.get("update_params", {})
 
                 # ── UPDATE / THREAT_ADD 공통: 파라미터 변경 ──
+                # mission.params 와 session_state 위젯 키를 동시에 갱신해야
+                # st.rerun() 후 사이드바 위젯에 즉시 반영됨
+                def _set(param_attr, ss_key, val):
+                    setattr(mission.params, param_attr, val)
+                    st.session_state[ss_key] = val
+
                 if action in ("UPDATE", "THREAT_ADD", "MISSION_PLAN"):
                     if u.get("safety_margin_km") is not None:
-                        mission.params.margin = u["safety_margin_km"]
+                        _set("margin",     "_mp_margin",      u["safety_margin_km"])
                     if u.get("rtb") is not None:
-                        mission.params.rtb = u["rtb"]
+                        _set("rtb",        "_mp_rtb",         u["rtb"])
                     if u.get("stpt_gap") is not None:
-                        mission.params.stpt_gap = u["stpt_gap"]
-                    if u.get("waypoint_name"):
-                        mission.params.waypoint = u["waypoint_name"]
+                        _set("stpt_gap",   "_mp_stpt_gap",    u["stpt_gap"])
                     if u.get("algorithm"):
-                        mission.params.algorithm = u["algorithm"]
+                        _set("algorithm",  "_mp_algorithm",   u["algorithm"])
                     if u.get("enable_3d") is not None:
-                        mission.params.enable_3d = u["enable_3d"]
+                        _set("enable_3d",  "_mp_enable_3d",   u["enable_3d"])
                     if u.get("target_lat") is not None:
-                        mission.params.target_lat = u["target_lat"]
+                        _set("target_lat", "_mp_target_lat",  u["target_lat"])
                     if u.get("target_lon") is not None:
-                        mission.params.target_lon = u["target_lon"]
+                        _set("target_lon", "_mp_target_lon",  u["target_lon"])
                     if u.get("target_name"):
                         mission.params.target_name = u["target_name"]
                     if u.get("start") and u["start"] in AIRPORTS:
-                        mission.params.start = u["start"]
+                        _set("start",      "_mp_start",       u["start"])
+                    if u.get("waypoint_name"):
+                        mission.params.waypoint = u["waypoint_name"]
 
                 # ── THREAT_ADD: 위협 자동 추가 ──
                 if action == "THREAT_ADD":
@@ -179,7 +203,7 @@ with col_left:
         if mission.threats:
             threat_df = pd.DataFrame([t.to_dict() for t in mission.threats])
             cols = [c for c in ['name', 'type', 'radius_km', 'lat', 'lon', 'alt'] if c in threat_df.columns]
-            st.dataframe(threat_df[cols], hide_index=True, use_container_width=True)
+            st.dataframe(threat_df[cols], hide_index=True, width="stretch")
             
             c_del, c_btn = st.columns([3, 1])
             del_name = c_del.selectbox("삭제할 위협", [t.name for t in mission.threats])
@@ -259,7 +283,7 @@ with col_left:
                     "출발기지": a.base,
                 })
             if asset_data:
-                st.dataframe(pd.DataFrame(asset_data), hide_index=True, use_container_width=True)
+                st.dataframe(pd.DataFrame(asset_data), hide_index=True, width="stretch")
 
             # MUM-T 비율 표시
             st.divider()
@@ -776,7 +800,7 @@ with col_right:
                 data_out.append(pt)
 
         stpt_df = pd.DataFrame(data_in + data_out)
-        st.dataframe(stpt_df, use_container_width=True, hide_index=True)
+        st.dataframe(stpt_df, width="stretch", hide_index=True)
 
         csv = stpt_df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 STPT CSV 다운로드", csv, "mission_stpt.csv", "text/csv")

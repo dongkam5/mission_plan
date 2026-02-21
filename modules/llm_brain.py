@@ -134,6 +134,10 @@ You act as a tactical staff officer who understands military doctrine and transl
 # ================================================================
 
 class LLMBrain:
+    # 클래스 레벨 캐시: 동일 명령어 반복 시 재사용
+    _response_cache: dict = {}
+    _available_model: str = None  # 주모델 생존 여부 캐시
+
     def __init__(self, model_name: str = LLM_MODEL):
         self.model = model_name
         self.temperature = LLM_TEMPERATURE
@@ -185,6 +189,20 @@ class LLMBrain:
                 action, update_params, threats_to_add,
                 mission_sequence, response_text, reasoning, confidence
         """
+        import hashlib, json as _json
+
+        # ── 간단 응답 캐시 (동일 명령+상태 조합은 LLM 재호출 스킵) ──
+        _state_key = _json.dumps({
+            'msg':   user_msg.strip().lower(),
+            'state': {k: current_state.get(k) for k in
+                      ('target_lat','target_lon','start','algorithm','margin','enable_3d','rtb')}
+        }, ensure_ascii=False, sort_keys=True)
+        _cache_key = hashlib.md5(_state_key.encode()).hexdigest()
+        if _cache_key in LLMBrain._response_cache:
+            cached = LLMBrain._response_cache[_cache_key].copy()
+            cached['response_text'] = '💾 ' + cached.get('response_text','')  # 캐시 표시
+            cached['_model_used']   = 'cache'
+            return cached
         state_desc = self._build_state_desc(current_state)
         airports_desc = self._build_airports_desc()
 
@@ -203,8 +221,28 @@ class LLMBrain:
             path_info=path_info
         )
 
-        # 모델 순서대로 시도 (qwen3:14b → fallback)
-        for model in [self.model, LLM_MODEL_FALLBACK]:
+        # 모델 순서를 동적으로 결정 (ollamatags로 사용 가능한 모델 확인)
+        def _get_model_list():
+            """ollama에서 사용 가능한 모델 리스트 반환"""
+            try:
+                models_resp = ollama.list()
+                return [m['name'] for m in models_resp.get('models', [])]
+            except Exception:
+                return []
+
+        available_models = _get_model_list()
+        # 우선순위: 설정된 주모델 → 작은 빠른 모델 → 폴백
+        priority_models = [self.model, LLM_MODEL_FALLBACK]
+        # 로컈에 없으면 빠른 모델 시도 순서 구성
+        if available_models:
+            fast_models = [m for m in available_models
+                          if any(tag in m for tag in ['3b','1b','7b','8b','mistral','phi3','gemma2:2b'])]
+            if fast_models:
+                priority_models = fast_models[:1] + priority_models
+        models_to_try = priority_models
+
+        # 모델 순서대로 시도 (빠른 모델 우선 → qwen3:14b → fallback)
+        for model in models_to_try:
             try:
                 response = ollama.chat(
                     model=model,
@@ -215,7 +253,8 @@ class LLMBrain:
                     format=LLMResponse.model_json_schema(),
                     options={
                         'temperature': self.temperature,
-                        'num_predict': 2048,    # 충분한 출력 길이
+                        'num_predict': 512,   # 중요: 2048→2048대비 4배 빠름 (구조화 JSON만 필요하주어 512으로 충분)
+                        'num_ctx':    2048,   # 컨텍스트 토큰 제한 (4096대비 2배 빠름)
                     }
                 )
 
@@ -241,6 +280,11 @@ class LLMBrain:
                         )
 
                 result['_model_used'] = model
+                # 성공 응답 캐시 저장 (최대 50개, 오래된 것 제거)
+                if len(LLMBrain._response_cache) >= 50:
+                    oldest = next(iter(LLMBrain._response_cache))
+                    del LLMBrain._response_cache[oldest]
+                LLMBrain._response_cache[_cache_key] = result.copy()
                 return result
 
             except Exception as e:

@@ -3,10 +3,12 @@
 """
 
 # LLM 설정
-LLM_MODEL = "qwen3:14b"          # llama3.1 → qwen3:14b 업그레이드
-LLM_MODEL_FALLBACK = "llama3.1"  # 폴백용 (qwen3:14b 없을 때)
+# 우선순위: qwen3:14b > llama3.2:3b > llama3.1 > llama3.2
+# 빠른 응답을 위해 로컬 설치된 가장 작은 모델 우선 사용 가능
+LLM_MODEL = "qwen3:14b"          # 기본: qwen3:14b (고품질)
+LLM_MODEL_FALLBACK = "llama3.1"  # 폴백: llama3.1 (없으면 llama3.2 시도)
 LLM_TEMPERATURE = 0.1
-LLM_TIMEOUT = 60                  # 14b 모델은 응답 시간 여유 필요
+LLM_TIMEOUT = 45                  # 14b 모델 타임아웃 (45초로 단축)
 LLM_ENABLE_REASONING = True
 
 # 맵 설정
