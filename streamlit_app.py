@@ -1,8 +1,9 @@
 """
-통합 임무계획 시스템 v10.0 (High Performance + UI Fixed)
-- UI 복구: STPT 리스트 및 다운로드 버튼 재등장
-- 시각화 개선: SAM(로켓), RADAR(와이파이) 아이콘 적용
-- 음영 반영: 히트맵에 지형 음영 적용
+통합 임무계획 시스템 v12.0 (MUM-T + Rule-based Validator)
+- LLM Brain v2.0: qwen3:14b 군사 전문 참모 AI
+- Formation Optimizer: MILP + 헝가리안 편대 구성
+- Mission Validator: 규칙 기반 7개 항목 검증 (교리 기반)
+- 교리 기반: JP3-30, AFDP3-03, FMI3-04.155, DAFMAN11-260
 """
 import streamlit as st
 import folium
@@ -11,9 +12,11 @@ from folium.plugins import HeatMap
 import pandas as pd
 import time
 
-from modules.config import AIRPORTS, MAP_CENTER, MAP_ZOOM, CHAT_CONTAINER_HEIGHT, AVAILABLE_ALGORITHMS
+from modules.config import AIRPORTS, MAP_CENTER, MAP_ZOOM, CHAT_CONTAINER_HEIGHT, AVAILABLE_ALGORITHMS, FORMATION_MAX_TOTAL
 from modules.mission_state import MissionState, Threat
 from modules.llm_brain import LLMBrain
+from modules.formation_optimizer import FormationOptimizer
+from modules.validator import MissionValidator
 from modules.pathfinder import AStarPathfinder, AStarPathfinder3D, smooth_path, smooth_path_3d
 from modules.pathfinder_optimized import AStarPathfinder3DOptimized, TerrainCacheFast
 from modules.pathfinder_rrt import RRTPathfinder, RRTStarPathfinder
@@ -21,8 +24,8 @@ from modules.terrain_loader import TerrainLoader
 from modules.xai_utils import XAIUtils
 
 # ===== 페이지 설정 =====
-st.set_page_config(page_title="IMPS v10.0 (Fixed)", layout="wide", initial_sidebar_state="collapsed")
-st.title("🚁 통합 임무계획 시스템 v10.0 (Optimization + Visualization)")
+st.set_page_config(page_title="IMPS v12.0 (MUM-T)", layout="wide", initial_sidebar_state="collapsed")
+st.title("🚁 통합 임무계획 시스템 v12.0 (MUM-T + Validator)")
 
 # ===== 상태 초기화 =====
 if "mission" not in st.session_state:
@@ -32,6 +35,9 @@ if "terrain" not in st.session_state:
     with st.spinner("🌍 지형 데이터 메모리 적재 중... (최초 1회)"):
         base_loader = TerrainLoader()
         st.session_state.terrain = TerrainCacheFast(base_loader)
+
+if "mission_sequence" not in st.session_state:
+    st.session_state.mission_sequence = []
 
 mission = st.session_state.mission
 terrain_fast = st.session_state.terrain 
@@ -44,7 +50,7 @@ if not hasattr(terrain_fast, 'get_elevation'):
 col_left, col_right = st.columns([1, 2])
 
 with col_left:
-    tab_ops, tab_intel, tab_xai, tab_debug = st.tabs(["💬 작전 통제", "⚠️ 위협 관리", "🤔 AI 판단 근거", "🔧 디버그"])
+    tab_ops, tab_intel, tab_formation, tab_validator, tab_xai, tab_debug = st.tabs(["💬 작전 통제", "⚠️ 위협 관리", "✈️ 편대 구성", "✅ 임무 검증", "🤔 AI 판단 근거", "🔧 디버그"])
 
     # 1. 작전 통제
     with tab_ops:
@@ -74,23 +80,72 @@ with col_left:
             with chat_container.chat_message(msg["role"]):
                 st.write(msg["content"])
 
-        if user_input := st.chat_input("명령 입력 (예: 고도 좀 낮춰줘)"):
+        if user_input := st.chat_input("명령 입력 (예: 적 레이더 37.5/127.8 피해서 저고도 침투 후 복귀)"):
             mission.add_chat_message("user", user_input)
             with st.spinner("🧠 AI 분석 중..."):
                 brain = LLMBrain()
-                path_analysis = None # (간소화)
+                path_analysis = None
                 result = brain.parse_tactical_command(user_input, mission.params.to_dict(), path_analysis)
-                
-                if result["action"] == "UPDATE":
-                    u = result["update_params"]
-                    if u.get("safety_margin_km") is not None: mission.params.margin = u["safety_margin_km"]
-                    if u.get("rtb") is not None: mission.params.rtb = u["rtb"]
-                    if u.get("stpt_gap") is not None: mission.params.stpt_gap = u["stpt_gap"]
-                    if u.get("waypoint_name"): mission.params.waypoint = u["waypoint_name"]
-                    if u.get("algorithm"): mission.params.algorithm = u["algorithm"]
-                    if u.get("enable_3d") is not None: mission.params.enable_3d = u["enable_3d"]
+
+                action = result.get("action", "CHAT")
+                u = result.get("update_params", {})
+
+                # ── UPDATE / THREAT_ADD 공통: 파라미터 변경 ──
+                if action in ("UPDATE", "THREAT_ADD", "MISSION_PLAN"):
+                    if u.get("safety_margin_km") is not None:
+                        mission.params.margin = u["safety_margin_km"]
+                    if u.get("rtb") is not None:
+                        mission.params.rtb = u["rtb"]
+                    if u.get("stpt_gap") is not None:
+                        mission.params.stpt_gap = u["stpt_gap"]
+                    if u.get("waypoint_name"):
+                        mission.params.waypoint = u["waypoint_name"]
+                    if u.get("algorithm"):
+                        mission.params.algorithm = u["algorithm"]
+                    if u.get("enable_3d") is not None:
+                        mission.params.enable_3d = u["enable_3d"]
+                    if u.get("target_lat") is not None:
+                        mission.params.target_lat = u["target_lat"]
+                    if u.get("target_lon") is not None:
+                        mission.params.target_lon = u["target_lon"]
+                    if u.get("target_name"):
+                        mission.params.target_name = u["target_name"]
+                    if u.get("start") and u["start"] in AIRPORTS:
+                        mission.params.start = u["start"]
+
+                # ── THREAT_ADD: 위협 자동 추가 ──
+                if action == "THREAT_ADD":
+                    for t_info in result.get("threats_to_add", []):
+                        try:
+                            new_threat = Threat(
+                                name=t_info.get("name", f"Threat-{len(mission.threats)+1:02d}"),
+                                type=t_info.get("type", "SAM"),
+                                lat=t_info.get("lat"),
+                                lon=t_info.get("lon"),
+                                radius_km=t_info.get("radius_km", 30.0),
+                                alt=0.0
+                            )
+                            # 지형 고도 자동 보정
+                            if new_threat.lat and new_threat.lon:
+                                ground_elev = terrain_fast.get_elevation(new_threat.lat, new_threat.lon)
+                                new_threat.alt = ground_elev + 10.0
+                            mission.add_threat(new_threat)
+                        except Exception:
+                            pass
+
+                # ── MISSION_PLAN: 임무 순서 표시 ──
+                if action == "MISSION_PLAN":
+                    seq = result.get("mission_sequence", [])
+                    if seq:
+                        st.session_state["mission_sequence"] = seq
 
                 ai_msg = result["response_text"]
+
+                # 모델 정보 및 신뢰도 표시
+                model_used = result.get("_model_used", "unknown")
+                confidence = result.get("confidence", 0.0)
+                ai_msg += f"\n\n`[{model_used} | 신뢰도: {confidence:.0%}]`"
+
                 mission.add_chat_message("assistant", ai_msg, result.get("reasoning", ""))
                 st.rerun()
 
@@ -132,12 +187,230 @@ with col_left:
                 mission.remove_threat(del_name)
                 st.rerun()
 
-    # 3. XAI & Debug
+    # 3. 편대 구성 (Formation Optimizer)
+    with tab_formation:
+        st.subheader("✈️ MUM-T 편대 구성 최적화")
+        st.caption("MILP + 헝가리안 | 근거: JP3-30, AFDP3-03, FMI3-04.155")
+
+        with st.form("formation_form"):
+            st.markdown("**임무 유형 선택**")
+            c1, c2, c3, c4 = st.columns(4)
+            use_isr    = c1.checkbox("🔵 ISR",    value=True)
+            use_sead   = c2.checkbox("🟡 SEAD",   value=True)
+            use_strike = c3.checkbox("🔴 STRIKE", value=True)
+            use_cas    = c4.checkbox("🟢 CAS",    value=False)
+
+            n_targets = st.number_input("목표 수", min_value=1, max_value=10, value=1)
+            max_assets = st.slider("최대 자산 수 (N_max)", 3, FORMATION_MAX_TOTAL, 8)
+
+            run_btn = st.form_submit_button("🚀 편대 구성 최적화 실행", type="primary")
+
+        if run_btn:
+            mission_types = []
+            if use_isr:    mission_types.append("ISR")
+            if use_sead:   mission_types.append("SEAD")
+            if use_strike: mission_types.append("STRIKE")
+            if use_cas:    mission_types.append("CAS")
+
+            if not mission_types:
+                st.warning("임무 유형을 하나 이상 선택하세요.")
+            else:
+                with st.spinner("🧮 MILP + 헝가리안 최적화 중..."):
+                    optimizer = FormationOptimizer()
+                    targets = [{"lat": mission.params.target_lat,
+                                "lon": mission.params.target_lon,
+                                "name": mission.params.target_name}]
+                    threats_dict = [t.to_dict() for t in mission.threats]
+                    f_result = optimizer.run(
+                        mission_types=mission_types,
+                        targets=targets,
+                        threats=threats_dict,
+                        base=mission.params.start,
+                        max_total=max_assets
+                    )
+                    mission.set_formation(f_result)
+                    st.session_state.mission_sequence = mission_types
+                st.rerun()
+
+        # 결과 표시
+        if mission.formation and mission.formation.is_feasible:
+            fr = mission.formation
+            utilization = getattr(fr, 'utilization_pct', 0)
+            st.success(f"✅ {fr.solver_status} | 계산시간: {fr.solve_time_ms:.1f}ms | 전력활용률: {utilization}%")
+
+            # 편대 구성 요약
+            col_f, col_r, col_k, col_t = st.columns(4)
+            col_f.metric("✈️ 전투기",   f"{fr.n_fighter}대",    delta=None)
+            col_r.metric("🔍 정찰UAV",  f"{fr.n_recon_uav}대",  delta=None)
+            col_k.metric("💥 자폭UAV",  f"{fr.n_attack_uav}대", delta=None)
+            col_t.metric("📊 총 비용",  f"{fr.total_cost:.0f}", delta=None)
+
+            # 자산별 배정 테이블
+            st.divider()
+            st.markdown("**자산 배정 결과 (헝가리안)**")
+            asset_data = []
+            type_icon = {"fighter": "✈️", "recon_uav": "🔍", "attack_uav": "💥"}
+            for a in fr.assets:
+                asset_data.append({
+                    "자산": f"{type_icon.get(a.asset_type,'?')} {a.callsign}",
+                    "유형": a.asset_type,
+                    "배정임무": a.assigned_mission or "-",
+                    "목표번호": str(a.assigned_target_idx + 1) if a.assigned_target_idx is not None else "-",
+                    "출발기지": a.base,
+                })
+            if asset_data:
+                st.dataframe(pd.DataFrame(asset_data), hide_index=True, use_container_width=True)
+
+            # MUM-T 비율 표시
+            st.divider()
+            total_uav = fr.n_recon_uav + fr.n_attack_uav
+            mumt_ratio = total_uav / fr.n_fighter if fr.n_fighter > 0 else 0
+            st.markdown(f"**MUM-T 비율**: 전투기 1 : UAV {mumt_ratio:.1f} "
+                        f"{'✅ 교리 충족' if mumt_ratio >= 2.0 else '⚠️ 권장 비율(1:2) 미달'}")
+
+    # 4. 임무 검증 (Validator)
+    with tab_validator:
+        st.subheader("✅ 규칙 기반 임무 검증")
+        st.caption("근거: AFDP5-0 COA Analysis & Wargaming, JP3-30 ACO, FMI3-04.155, DAFMAN11-260")
+
+        # 검증 실행 버튼
+        col_vbtn, col_vinfo = st.columns([1, 2])
+        run_validation = col_vbtn.button("🔍 임무 검증 실행", type="primary", use_container_width=True)
+        col_vinfo.info("편대 구성 후 검증을 실행하면 교리 기반 7개 항목을 자동 검사합니다.")
+
+        if run_validation:
+            with st.spinner("📋 임무 계획 검증 중..."):
+                validator = MissionValidator()
+                threats_dict = [t.to_dict() for t in mission.threats]
+                seq = st.session_state.get("mission_sequence", [])
+
+                # formation_paths가 있으면 경로 포함 검증
+                fp = st.session_state.get("_formation_paths", {})
+
+                report = validator.validate(
+                    formation_result=mission.formation,
+                    formation_paths=fp,
+                    threats=threats_dict,
+                    mission_sequence=seq,
+                    margin_km=mission.params.margin
+                )
+                st.session_state["_validation_report"] = report
+
+        # 검증 결과 표시
+        report = st.session_state.get("_validation_report", None)
+        if report:
+            # 요약 배너
+            if report.is_valid:
+                st.success(f"🟢 {report.summary()} | 검증 시간: {report.validate_time_ms:.1f}ms")
+            else:
+                st.error(f"🔴 {report.summary()} | 검증 시간: {report.validate_time_ms:.1f}ms")
+
+            st.divider()
+
+            # 검증 항목별 결과
+            if not report.issues:
+                st.balloons()
+                st.success("모든 검증 항목 통과! 임무 계획이 교리에 부합합니다.")
+            else:
+                # 심각도별로 분류
+                errors   = [i for i in report.issues if i.severity == "ERROR"]
+                warnings = [i for i in report.issues if i.severity == "WARNING"]
+                infos    = [i for i in report.issues if i.severity == "INFO"]
+
+                if errors:
+                    st.markdown("### 🔴 오류 (ERROR) - 즉시 수정 필요")
+                    for issue in errors:
+                        with st.expander(f"{issue.icon} [{issue.rule_id}] {issue.message}", expanded=True):
+                            col_a, col_b = st.columns(2)
+                            col_a.markdown(f"**교리 근거:** {issue.doctrine_ref}")
+                            if issue.asset_id:
+                                col_b.markdown(f"**관련 자산:** `{issue.asset_id}`")
+                            if issue.suggestion:
+                                st.warning(f"💡 권고사항: {issue.suggestion}")
+
+                if warnings:
+                    st.markdown("### 🟡 경고 (WARNING) - 검토 권장")
+                    for issue in warnings:
+                        with st.expander(f"{issue.icon} [{issue.rule_id}] {issue.message}"):
+                            col_a, col_b = st.columns(2)
+                            col_a.markdown(f"**교리 근거:** {issue.doctrine_ref}")
+                            if issue.asset_id:
+                                col_b.markdown(f"**관련 자산:** `{issue.asset_id}`")
+                            if issue.suggestion:
+                                st.info(f"💡 권고사항: {issue.suggestion}")
+
+                if infos:
+                    st.markdown("### 🔵 참고 (INFO)")
+                    for issue in infos:
+                        st.info(f"{issue.icon} {issue.message}")
+
+            st.divider()
+
+            # 검증 규칙 목록
+            with st.expander("📋 검사된 규칙 목록"):
+                rules = {
+                    "MISSION_SEQUENCE": "Rule 5 - 임무 순서 (JP3-30 MAAP)",
+                    "MUMT_RATIO":       "Rule 7 - MUM-T 비율 (FMI3-04.155)",
+                    "NFZ":              "Rule 1 - 비행금지구역 침범 (JP3-30 ACO)",
+                    "THREAT":           "Rule 2 - 위협 반경 침범 (JP3-30 ROE)",
+                    "ALT":              "Rule 3 - 최소 고도 (FMI3-04.155)",
+                    "RANGE":            "Rule 6 - 항속거리 (DAFMAN11-260)",
+                    "ASSET_COLLISION":  "Rule 4 - 자산 충돌 (FMI3-04.155)",
+                }
+                checked_summary = []
+                for rule_id in report.checked_rules:
+                    prefix = rule_id.split("_")[0]
+                    label = rules.get(rule_id) or rules.get(prefix, f"Rule - {rule_id}")
+                    checked_summary.append(label)
+
+                # 중복 제거 후 표시
+                for label in sorted(set(checked_summary)):
+                    st.markdown(f"- ✓ {label}")
+
+            # JSON 내보내기
+            with st.expander("📄 검증 보고서 JSON"):
+                st.json(report.to_dict())
+
+        else:
+            # 미실행 안내
+            st.info("편대 구성 탭에서 최적화를 먼저 실행한 후 검증을 수행하세요.")
+
+            # 검증 항목 미리보기
+            st.markdown("### 📋 검증 항목 (7개 규칙)")
+            rules_preview = [
+                ("Rule 1", "🟥", "비행금지구역(NFZ) 침범 검사",   "JP3-30 ACO"),
+                ("Rule 2", "🟧", "위협 반경(SAM/RADAR) 침범 검사", "JP3-30 ROE"),
+                ("Rule 3", "🟨", "최소 비행고도 검사 (AGL 200m)",  "FMI3-04.155"),
+                ("Rule 4", "🟩", "자산 간 충돌 위험 검사",         "FMI3-04.155"),
+                ("Rule 5", "🟦", "임무 수행 순서 검사 (ISR→SEAD→STRIKE)", "JP3-30 MAAP"),
+                ("Rule 6", "🟪", "항속거리 초과 검사",             "DAFMAN11-260"),
+                ("Rule 7", "⬜", "MUM-T 비율 검사 (1:2 이상)",    "FMI3-04.155"),
+            ]
+            for rule_id, icon, desc, ref in rules_preview:
+                st.markdown(f"{icon} **{rule_id}** {desc} _{ref}_")
+
+    # 5. XAI & Debug
     with tab_xai:
         st.subheader("🤔 AI 판단 근거")
         if mission.chat_history:
             last = [m for m in mission.chat_history if m["role"] == "assistant"]
-            if last: st.info(f"**Reasoning:**\n\n{last[-1].get('reasoning', '')}")
+            if last and last[-1].get('reasoning'):
+                reasoning = last[-1].get('reasoning', '')
+                # Why / What / How 구조로 파싱해서 표시
+                st.info(f"**📋 판단 근거:**\n\n{reasoning}")
+
+        # 임무 순서 표시
+        if st.session_state.get("mission_sequence"):
+            st.divider()
+            st.subheader("📌 임무 수행 순서")
+            seq = st.session_state["mission_sequence"]
+            cols = st.columns(len(seq))
+            colors = {"ISR": "🔵", "SEAD": "🟡", "STRIKE": "🔴", "CAS": "🟢"}
+            for i, (col, mission_type) in enumerate(zip(cols, seq)):
+                with col:
+                    icon = colors.get(mission_type, "⚪")
+                    st.metric(f"Step {i+1}", f"{icon} {mission_type}")
+
         st.divider()
         show_heatmap = st.checkbox("위험도 히트맵 (음영 반영)", value=True)
 
@@ -163,7 +436,7 @@ with col_right:
     # 좌표 설정
     start_coord = AIRPORTS[mission.params.start]["coords"]
     target_coord = [mission.params.target_lat, mission.params.target_lon]
-    
+
     if mission.params.enable_3d:
         s_elev = terrain_fast.get_elevation(*start_coord)
         t_elev = terrain_fast.get_elevation(*target_coord)
@@ -171,74 +444,263 @@ with col_right:
         target_coord = [*target_coord, t_elev + 800]
 
     threats_dict = [t.to_dict() for t in mission.threats]
-    
-    # 계산 실행
+
+    # ── 자산별 경로 색상 팔레트 ──
+    # 임무 유형별 색상 (교리 색상 체계 반영)
+    MISSION_COLOR = {
+        "ISR":    "#2196F3",  # 파랑 - 정찰
+        "SEAD":   "#FF9800",  # 주황 - 방공제압
+        "STRIKE": "#F44336",  # 빨강 - 타격
+        "CAS":    "#4CAF50",  # 초록 - 근접지원
+    }
+    ASSET_COLOR = {
+        "fighter":    "#E91E63",  # 핫핑크 - 전투기
+        "recon_uav":  "#2196F3",  # 파랑 - 정찰UAV
+        "attack_uav": "#FF5722",  # 딥오렌지 - 자폭UAV
+    }
+
+    # ── 경로 계산 ──
     start_time = time.time()
     final_in = []
     final_out = []
-    
-    # Ingress
-    if mission.params.algorithm == "A* 3D":
-        raw_in = pathfinder.find_path_3d_fast(start_coord, target_coord, threats_dict, mission.params.margin)
-    elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
-        raw_in = pathfinder.find_path_3d(start_coord, target_coord, threats_dict, mission.params.margin)
-    else:
-        raw_in = pathfinder.find_path(start_coord[:2], target_coord[:2], threats_dict, mission.params.margin)
-        
-    final_in = smooth_path_3d(raw_in) if (raw_in and len(raw_in[0])==3) else smooth_path(raw_in)
 
-    # Egress (RTB)
-    if mission.params.rtb and final_in:
-        egress_start = final_in[-1]
-        egress_end = start_coord
+    # 편대 구성 결과가 있으면 자산별 경로 계산
+    formation_paths = {}  # {asset_id: {"in": path, "out": path, "color": color}}
+
+    if mission.formation and mission.formation.is_feasible and mission.formation.assets:
+        for asset in mission.formation.assets:
+            # 자산별 출발기지 좌표
+            asset_base_coords = AIRPORTS.get(asset.base, AIRPORTS[mission.params.start])["coords"]
+            a_start = list(asset_base_coords)
+            a_target = list(target_coord[:2])
+
+            if mission.params.enable_3d:
+                a_elev = terrain_fast.get_elevation(*a_start)
+                # 자산 타입별 비행고도 오프셋
+                from modules.config import ASSET_PERFORMANCE
+                alt_offset = ASSET_PERFORMANCE.get(asset.asset_type, {}).get("altitude_m", 800)
+                a_start = [*a_start, a_elev + alt_offset * 0.3]
+                t_elev2 = terrain_fast.get_elevation(*a_target)
+                a_target = [*a_target, t_elev2 + alt_offset * 0.3]
+
+            try:
+                if mission.params.algorithm == "A* 3D":
+                    raw = pathfinder.find_path_3d_fast(a_start, a_target, threats_dict, mission.params.margin)
+                elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
+                    raw = pathfinder.find_path_3d(a_start, a_target, threats_dict, mission.params.margin)
+                else:
+                    raw = pathfinder.find_path(a_start[:2], a_target[:2], threats_dict, mission.params.margin)
+                path_in = smooth_path_3d(raw) if (raw and len(raw[0]) == 3) else smooth_path(raw)
+            except Exception:
+                path_in = []
+
+            path_out = []
+            if mission.params.rtb and path_in:
+                try:
+                    eg_start = path_in[-1]
+                    eg_end   = a_start
+                    if mission.params.algorithm == "A* 3D":
+                        raw_o = pathfinder.find_path_3d_fast(eg_start, eg_end, threats_dict, mission.params.margin)
+                    elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
+                        raw_o = pathfinder.find_path_3d(eg_start, eg_end, threats_dict, mission.params.margin)
+                    else:
+                        raw_o = pathfinder.find_path(eg_start[:2], eg_end[:2], threats_dict, mission.params.margin)
+                    path_out = smooth_path_3d(raw_o) if (raw_o and len(raw_o[0]) == 3) else smooth_path(raw_o)
+                except Exception:
+                    path_out = []
+
+            color = MISSION_COLOR.get(asset.assigned_mission, ASSET_COLOR.get(asset.asset_type, "#607D8B"))
+            formation_paths[asset.asset_id] = {
+                "in": path_in, "out": path_out,
+                "color": color, "callsign": asset.callsign,
+                "mission": asset.assigned_mission or "?",
+                "type": asset.asset_type
+            }
+            # 대표 경로 (첫 번째 자산)
+            if not final_in and path_in:
+                final_in = path_in
+                final_out = path_out
+
+    # validator용 경로 데이터 저장 ({"asset_id": {"in": path, "out": path}})
+    if formation_paths:
+        st.session_state["_formation_paths"] = {
+            aid: {"in": d["in"], "out": d["out"]}
+            for aid, d in formation_paths.items()
+        }
+
+    else:
+        # 편대 없으면 기존 단일 경로
         if mission.params.algorithm == "A* 3D":
-            raw_out = pathfinder.find_path_3d_fast(egress_start, egress_end, threats_dict, mission.params.margin)
+            raw_in = pathfinder.find_path_3d_fast(start_coord, target_coord, threats_dict, mission.params.margin)
         elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
-            raw_out = pathfinder.find_path_3d(egress_start, egress_end, threats_dict, mission.params.margin)
+            raw_in = pathfinder.find_path_3d(start_coord, target_coord, threats_dict, mission.params.margin)
         else:
-            raw_out = pathfinder.find_path(egress_start[:2], egress_end[:2], threats_dict, mission.params.margin) 
-        final_out = smooth_path_3d(raw_out) if (raw_out and len(raw_out[0])==3) else smooth_path(raw_out)
+            raw_in = pathfinder.find_path(start_coord[:2], target_coord[:2], threats_dict, mission.params.margin)
+        final_in = smooth_path_3d(raw_in) if (raw_in and len(raw_in[0]) == 3) else smooth_path(raw_in)
+
+        if mission.params.rtb and final_in:
+            eg_s = final_in[-1]
+            eg_e = start_coord
+            if mission.params.algorithm == "A* 3D":
+                raw_out = pathfinder.find_path_3d_fast(eg_s, eg_e, threats_dict, mission.params.margin)
+            elif hasattr(pathfinder, 'find_path_3d') and mission.params.enable_3d:
+                raw_out = pathfinder.find_path_3d(eg_s, eg_e, threats_dict, mission.params.margin)
+            else:
+                raw_out = pathfinder.find_path(eg_s[:2], eg_e[:2], threats_dict, mission.params.margin)
+            final_out = smooth_path_3d(raw_out) if (raw_out and len(raw_out[0]) == 3) else smooth_path(raw_out)
 
     calc_time = time.time() - start_time
     st.session_state.current_path = final_in
     st.caption(f"⏱️ 계산 시간: {calc_time:.3f}초")
 
-    # ===== 지도 시각화 =====
-    m = folium.Map(location=MAP_CENTER, zoom_start=MAP_ZOOM)
+    # ===== 지도 시각화 (개선 v2.0) =====
+    m = folium.Map(
+        location=MAP_CENTER, zoom_start=MAP_ZOOM,
+        tiles="CartoDB positron"  # 밝은 배경 → 경로 가시성 향상
+    )
 
-    folium.Marker(start_coord[:2], icon=folium.Icon(color="blue", icon="plane"), tooltip="Start").add_to(m)
-    folium.Marker(target_coord[:2], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"), tooltip="Target").add_to(m)
+    # ── [Layer 1] 히트맵 (가장 아래) ──
+    if 'show_heatmap' in locals() and show_heatmap and mission.threats:
+        h_data = XAIUtils.generate_heatmap_data(threats_dict, mission.params.margin, terrain_loader=terrain_fast)
+        if h_data:
+            HeatMap(h_data, radius=15, blur=20, min_opacity=0.15, max_opacity=0.5).add_to(m)
 
-    # [수정] 위협 아이콘 적용
+    # ── [Layer 2] 위협 영역 (반투명, fill_opacity 낮춰서 경로가 보이게) ──
     for t in mission.threats:
-        color = "crimson" if t.type == "SAM" else ("purple" if t.type == "RADAR" else "orange")
-        
+        t_color_map = {"SAM": ("#D32F2F", "red"), "RADAR": ("#6A1B9A", "purple"), "NFZ": ("#E65100", "orange")}
+        hex_color, icon_color = t_color_map.get(t.type, ("#607D8B", "gray"))
         if t.type == "NFZ":
-            folium.Rectangle([[t.lat_min, t.lon_min], [t.lat_max, t.lon_max]], color=color, fill=True).add_to(m)
-        else:
-            # 원 그리기
-            folium.Circle([t.lat, t.lon], radius=t.radius_km*1000, color=color, fill=True, fill_opacity=0.2).add_to(m)
-            
-            # 중앙 아이콘 (로켓/와이파이)
+            folium.Rectangle(
+                [[t.lat_min, t.lon_min], [t.lat_max, t.lon_max]],
+                color=hex_color, weight=2,
+                fill=True, fill_color=hex_color, fill_opacity=0.1
+            ).add_to(m)
+        elif t.lat and t.lon:
+            # 위협 원: fill_opacity 낮춰서 경로가 위에 보이게
+            folium.Circle(
+                [t.lat, t.lon], radius=t.radius_km * 1000,
+                color=hex_color, weight=2,
+                fill=True, fill_color=hex_color, fill_opacity=0.08  # 0.2 → 0.08
+            ).add_to(m)
+            # 테두리 강조용 외곽선 (점선)
+            folium.Circle(
+                [t.lat, t.lon], radius=t.radius_km * 1000,
+                color=hex_color, weight=2.5, opacity=0.7,
+                fill=False, dash_array="8 4"
+            ).add_to(m)
             icon_name = "rocket" if t.type == "SAM" else "wifi"
             folium.Marker(
                 [t.lat, t.lon],
-                icon=folium.Icon(color=color, icon=icon_name, prefix="fa"),
-                tooltip=f"{t.type}: {t.name}"
+                icon=folium.Icon(color=icon_color, icon=icon_name, prefix="fa"),
+                tooltip=f"{t.type}: {t.name} (반경 {t.radius_km:.0f}km)"
             ).add_to(m)
 
-    if final_in:
-        folium.PolyLine([(p[0], p[1]) for p in final_in], color="blue", weight=4, opacity=0.8).add_to(m)
-    if final_out:
-        folium.PolyLine([(p[0], p[1]) for p in final_out], color="orange", weight=4, dash_array="5, 5").add_to(m)
+    # ── [Layer 3] 경로선 (두껍게, 경계선 효과로 가시성 극대화) ──
+    PATH_WEIGHT_INGRESS  = 6   # ingress 굵기 (기존 3 → 6)
+    PATH_WEIGHT_EGRESS   = 4   # egress 굵기  (기존 2 → 4)
+    PATH_OUTLINE_WEIGHT  = 9   # 외곽선 굵기 (경로 위에 그리는 흰 외곽선)
 
-    # 히트맵 (음영 반영)
-    if 'show_heatmap' in locals() and show_heatmap and mission.threats:
-        # [핵심] terrain_fast를 넘겨줘서 음영 계산 수행
-        h_data = XAIUtils.generate_heatmap_data(threats_dict, mission.params.margin, terrain_loader=terrain_fast)
-        if h_data: HeatMap(h_data, radius=15, blur=20, min_opacity=0.2).add_to(m)
+    def draw_path_with_outline(path_coords, color, weight, opacity, dash="", tooltip_text=""):
+        """경로를 흰 외곽선 + 색상 내부선으로 그려 가시성 극대화"""
+        if not path_coords:
+            return
+        latlon = [(p[0], p[1]) for p in path_coords]
+        # 흰색 외곽선 (배경)
+        folium.PolyLine(
+            latlon, color="white", weight=weight + 3,
+            opacity=min(opacity + 0.2, 1.0), tooltip=tooltip_text
+        ).add_to(m)
+        # 실제 색상 선
+        kwargs = dict(color=color, weight=weight, opacity=opacity, tooltip=tooltip_text)
+        if dash:
+            kwargs["dash_array"] = dash
+        folium.PolyLine(latlon, **kwargs).add_to(m)
 
-    st_folium(m, width="100%", height=700, returned_objects=[])
+    if formation_paths:
+        type_icon_map = {"fighter": "✈", "recon_uav": "👁", "attack_uav": "💥"}
+        for asset_id, pdata in formation_paths.items():
+            clr   = pdata["color"]
+            label = f"{type_icon_map.get(pdata['type'],'?')} {pdata['callsign']} [{pdata['mission']}]"
+
+            # Ingress: 굵은 실선 + 흰 외곽선
+            if pdata["in"]:
+                draw_path_with_outline(
+                    pdata["in"], clr,
+                    weight=PATH_WEIGHT_INGRESS, opacity=0.95,
+                    tooltip_text=f"{label} ▶ Ingress"
+                )
+                # 출발점 원형 마커 (크게)
+                folium.CircleMarker(
+                    pdata["in"][0][:2], radius=7,
+                    color="white", weight=2,
+                    fill=True, fill_color=clr, fill_opacity=0.95,
+                    tooltip=label
+                ).add_to(m)
+                # 목표점 도착 마커
+                folium.CircleMarker(
+                    pdata["in"][-1][:2], radius=6,
+                    color=clr, weight=2,
+                    fill=True, fill_color="white", fill_opacity=0.9,
+                    tooltip=f"{label} 도착"
+                ).add_to(m)
+
+            # Egress: 점선 + 흰 외곽선
+            if pdata["out"]:
+                draw_path_with_outline(
+                    pdata["out"], clr,
+                    weight=PATH_WEIGHT_EGRESS, opacity=0.75,
+                    dash="8 5",
+                    tooltip_text=f"{label} ◀ Egress"
+                )
+    else:
+        # 단일 경로 (기존) - 역시 두껍게
+        if final_in:
+            draw_path_with_outline(final_in, "#1565C0", weight=6, opacity=0.95, tooltip_text="Ingress")
+        if final_out:
+            draw_path_with_outline(final_out, "#E65100", weight=5, opacity=0.85, dash="8 5", tooltip_text="Egress")
+
+    # ── [Layer 4] 출발·목표 마커 (경로 위에) ──
+    folium.Marker(
+        start_coord[:2],
+        icon=folium.Icon(color="blue", icon="plane", prefix="fa"),
+        tooltip=f"🛫 Base: {mission.params.start}"
+    ).add_to(m)
+    folium.Marker(
+        target_coord[:2],
+        icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"),
+        tooltip=f"🎯 Target: {mission.params.target_name}"
+    ).add_to(m)
+
+    # ── 범례 (편대 구성 시) ──
+    if formation_paths:
+        type_icon_map2 = {"fighter": "✈", "recon_uav": "🔍", "attack_uav": "💥"}
+        legend_html = (
+            "<div style='background:rgba(15,15,25,0.88);color:white;"
+            "padding:10px 14px;border-radius:8px;font-size:12px;"
+            "border:1px solid rgba(255,255,255,0.2);min-width:180px;'>"
+            "<b style='font-size:13px;'>📍 자산 경로 범례</b><br><hr style='margin:4px 0;opacity:0.3;'>"
+        )
+        for asset_id, pdata in formation_paths.items():
+            icon_c = type_icon_map2.get(pdata["type"], "?")
+            # Ingress: 실선, Egress: 점선
+            legend_html += (
+                f"<div style='margin:3px 0;'>"
+                f"<span style='display:inline-block;width:28px;height:4px;"
+                f"background:{pdata['color']};border-radius:2px;vertical-align:middle;margin-right:6px;'></span>"
+                f"{icon_c} {pdata['callsign']} "
+                f"<span style='color:#aaa;font-size:11px;'>[{pdata['mission']}]</span></div>"
+            )
+        if mission.params.rtb:
+            legend_html += (
+                "<div style='margin-top:6px;color:#aaa;font-size:10px;'>"
+                "실선: Ingress &nbsp;┆&nbsp; 점선: Egress</div>"
+            )
+        legend_html += "</div>"
+        m.get_root().html.add_child(folium.Element(
+            f"<div style='position:fixed;bottom:40px;left:40px;z-index:9999;'>{legend_html}</div>"
+        ))
+
+    st_folium(m, width="100%", height=720, returned_objects=[])
 
     # ===== [복구 완료] STPT 테이블 및 다운로드 =====
     if final_in:
