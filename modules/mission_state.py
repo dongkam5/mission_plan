@@ -1,5 +1,5 @@
 """
-미션 상태 관리 - 위협 고도 속성 포함 (자동 설정용)
+미션 상태 관리 - 위협 DB 내장 및 정밀 제원(XAI) 속성 포함
 """
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional
@@ -7,6 +7,16 @@ import json
 from datetime import datetime
 from modules.config import DEFAULT_SAFETY_MARGIN, DEFAULT_STPT_GAP, LOG_DIR, ENABLE_LOGGING, DEFAULT_ALGORITHM, ENABLE_3D
 import os
+
+# 💡 [NEW] 적성국 방공망/레이더 제원 데이터베이스 (F-16 전투기 대응 기준)
+THREAT_DB = {
+    "S-400 Triumf (SA-21)": {"type": "SAM", "radius_km": 250.0, "loss": 6.0, "rcs_m2": 2.5, "pd_k": 0.50, "sskp": 0.90, "peak_ratio": 0.32, "sigma_ratio": 0.25},
+    "S-300 PMU2 (SA-20)":   {"type": "SAM", "radius_km": 195.0, "loss": 7.0, "rcs_m2": 2.5, "pd_k": 0.45, "sskp": 0.85, "peak_ratio": 0.33, "sigma_ratio": 0.20},
+    "Buk-M2 (SA-17)":       {"type": "SAM", "radius_km": 45.0,  "loss": 8.0, "rcs_m2": 2.5, "pd_k": 0.40, "sskp": 0.80, "peak_ratio": 0.33, "sigma_ratio": 0.20},
+    "Pantsir-S1 (SA-22)":   {"type": "SAM", "radius_km": 18.0,  "loss": 9.0, "rcs_m2": 2.5, "pd_k": 0.35, "sskp": 0.70, "peak_ratio": 0.33, "sigma_ratio": 0.15},
+    "S-75 Dvina (SA-2)":    {"type": "SAM", "radius_km": 45.0,  "loss": 12.0,"rcs_m2": 2.5, "pd_k": 0.20, "sskp": 0.40, "peak_ratio": 0.44, "sigma_ratio": 0.15},
+    "조기경보 레이더":        {"type": "RADAR","radius_km": 400.0, "loss": 5.0, "rcs_m2": 2.5, "pd_k": 0.30, "sskp": 0.0,  "peak_ratio": 0.0,  "sigma_ratio": 0.0}
+}
 
 @dataclass
 class MissionParams:
@@ -41,18 +51,26 @@ class Threat:
     lat: Optional[float] = None
     lon: Optional[float] = None
     radius_km: Optional[float] = None
-    alt: float = 0.0  # [NEW] 해발고도 (m)
+    alt: float = 0.0  # 해발고도 (m)
     lat_min: Optional[float] = None
     lat_max: Optional[float] = None
     lon_min: Optional[float] = None
     lon_max: Optional[float] = None
+    
+    # 💡 [NEW] 정밀 XAI 파라미터 (기본값 설정)
+    loss: float = 8.0
+    rcs_m2: float = 2.5
+    pd_k: float = 0.4
+    sskp: float = 0.75
+    pk_peak_km: float = 0.0
+    pk_sigma_km: float = 0.0
+    weight: float = 1.0
     
     def to_dict(self):
         return {k: v for k, v in asdict(self).items() if v is not None}
     
     @classmethod
     def from_dict(cls, data: dict):
-        # 구버전 데이터 호환성을 위해 alt 없으면 0.0 처리
         if 'alt' not in data and data.get('type') in ['SAM', 'RADAR']:
             data['alt'] = 0.0
         return cls(**data)
@@ -63,7 +81,6 @@ class MissionState:
     
     def __init__(self):
         self.params = MissionParams()
-        # 기본 위협 (고도는 0으로 초기화, 로더에서 자동 보정 가능)
         self.threats: List[Threat] = [
             Threat(name="Default SAM", type="SAM", lat=37.200, lon=127.800, radius_km=20, alt=0)
         ]
@@ -72,19 +89,15 @@ class MissionState:
         ]
         
     def add_threat(self, threat: Threat):
-        """위협 추가"""
         self.threats.append(threat)
         
     def remove_threat(self, name: str):
-        """위협 삭제"""
         self.threats = [t for t in self.threats if t.name != name]
         
     def add_chat_message(self, role: str, content: str, reasoning: str = ""):
-        """채팅 메시지 추가"""
         self.chat_history.append({"role": role, "content": content, "reasoning": reasoning})
         
     def save_to_file(self, filename: str):
-        """상태 저장"""
         if ENABLE_LOGGING:
             os.makedirs(LOG_DIR, exist_ok=True)
             filepath = os.path.join(LOG_DIR, filename)
@@ -99,7 +112,6 @@ class MissionState:
     
     @classmethod
     def load_from_file(cls, filename: str):
-        """저장된 상태 복원"""
         filepath = os.path.join(LOG_DIR, filename)
         with open(filepath, 'r', encoding='utf-8') as f:
             data = json.load(f)

@@ -1,6 +1,9 @@
 """
-XAI (Explainable AI) 유틸리티 - 레이더 음영 시각화 포함 (최적화 반영)
+XAI (Explainable AI) 유틸리티 
+- 레이더 음영 시각화 포함
+- F-16 및 적성 방공망 현실화 파라미터 적용 (ZeroDivisionError 패치 완료)
 """
+
 import numpy as np
 import math
 from typing import List, Dict, Tuple
@@ -69,12 +72,18 @@ class XAIUtils:
                     if not is_visible:
                         continue  # 지형에 가려지면 이 위협에 대해서는 위험도 0
 
-                # P_D: SNR 기반 탐지확률
+                # ---------------------------------------------------------
+                # [1] P_D: SNR 기반 탐지확률 (F-16 & 적성국 레이더 현실화)
+                # ---------------------------------------------------------
                 R_E = threat_radius
                 R_D = R_E + margin
-                loss = float(t.get("loss", 3.0))
-                rcs_m2 = float(t.get("rcs_m2", 5.0))
-                pd_k = float(t.get("pd_k", 0.15))
+                
+                # 시스템 손실(대기 감쇠, 기계적 손실 등)
+                loss = float(t.get("loss", 8.0)) 
+                # F-16 무장 장착 상태(Combat Configuration)의 평균 RCS
+                rcs_m2 = float(t.get("rcs_m2", 2.5)) 
+                # 탐지 곡선의 가파름(Steepness)
+                pd_k = float(t.get("pd_k", 0.4)) 
 
                 PD_AT_RD = 0.1
                 logit_pd = math.log(PD_AT_RD / (1.0 - PD_AT_RD))
@@ -92,13 +101,25 @@ class XAIUtils:
                 P_D = 1.0 / (1.0 + math.exp(-pd_k * (snr_db - pd_th_db)))
                 P_D = max(0.0, min(1.0, P_D))
 
-                # P_K: 피격확률 (가우시안)
+                # ---------------------------------------------------------
+                # [2] P_K: 피격확률 (단발 격추 확률 SSKP & NEZ 반영)
+                # ---------------------------------------------------------
                 if dist_km >= R_E:
                     P_K = 0.0
                 else:
-                    d0 = float(t.get("pk_peak_km", 0.6 * R_E))
-                    sigma = float(t.get("pk_sigma_km", 0.25 * R_E))
-                    P_K = math.exp(-((dist_km - d0) ** 2) / (2.0 * sigma ** 2))
+                    # 단발 격추 확률(SSKP)
+                    sskp = float(t.get("sskp", 0.75))
+                    # No Escape Zone (가장 치명적인 거리)
+                    d0 = float(t.get("pk_peak_km", 0.35 * R_E)) 
+                    # 유효 교전 구역의 너비
+                    sigma = float(t.get("pk_sigma_km", 0.2 * R_E)) 
+                    
+                    # 💡 [버그 수정] 레이더처럼 sigma나 sskp가 0인 경우 방어 로직
+                    if sigma <= 0.0 or sskp <= 0.0:
+                        P_K = 0.0
+                    else:
+                        P_K = sskp * math.exp(-((dist_km - d0) ** 2) / (2.0 * sigma ** 2))
+                        
                     P_K = max(0.0, min(1.0, P_K))
 
                 weight = float(t.get("weight", 1.0))
