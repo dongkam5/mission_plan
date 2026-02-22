@@ -2,6 +2,7 @@
 A* 3D Optimized Pathfinder (List 호환 수정 버전)
 - TerrainCacheFast: 리스트 형태의 데이터셋 지원
 - Altitude quantization + near-goal termination
+- 레이더 음영(Shadow) 완벽 지원
 """
 
 import math
@@ -9,6 +10,11 @@ import heapq
 import numpy as np
 from typing import List, Tuple
 from modules.config import MAP_BOUNDS, GRID_SIZE, ALTITUDE_MIN, ALTITUDE_MAX, MIN_ALTITUDE_AGL
+
+try:
+    from modules.radar_shadow import check_line_of_sight
+except ImportError:
+    def check_line_of_sight(*args, **kwargs): return True
 
 LAT_TO_KM = 110.57
 
@@ -23,13 +29,11 @@ class TerrainCacheFast:
         self.bounds = {}
         self.pixel_size = {}
 
-        # [수정] 딕셔너리(.items())가 아닌 리스트 순회로 변경
-        # TerrainLoader.datasets는 [(bounds, ds_obj), ...] 형태임
         if isinstance(terrain_loader.datasets, list):
             for i, (bounds, ds) in enumerate(terrain_loader.datasets):
-                name = f"tile_{i}"  # 임의의 타일 이름 생성
+                name = f"tile_{i}"
                 try:
-                    data = ds.read(1)  # numpy array 전체 로드
+                    data = ds.read(1)
                     self.grids[name] = data
                     self.bounds[name] = bounds
                     self.pixel_size[name] = (
@@ -39,7 +43,6 @@ class TerrainCacheFast:
                 except Exception as e:
                     print(f"⚠️ 타일 캐싱 실패 ({name}): {e}")
         
-        # 만약 딕셔너리라면 (구버전 호환)
         elif isinstance(terrain_loader.datasets, dict):
             for name, ds in terrain_loader.datasets.items():
                 data = ds.read(1)
@@ -53,31 +56,25 @@ class TerrainCacheFast:
         print(f"✅ TerrainCacheFast 초기화 완료 ({len(self.grids)} tiles loaded)")
 
     def get(self, lat: float, lon: float) -> float:
-        """빠른 DEM 조회"""
         key = (round(lat, 3), round(lon, 3))
         if key in self.cache:
             return self.cache[key]
 
-        # 메모리에 로드된 그리드에서 검색
         for name, b in self.bounds.items():
             if b.bottom <= lat <= b.top and b.left <= lon <= b.right:
                 pw, ph = self.pixel_size[name]
                 
-                # 좌표 -> 픽셀 인덱스
                 col = int((lon - b.left) / pw)
                 row = int((b.top - lat) / ph)
                 
-                # 배열 범위 체크
                 h, w = self.grids[name].shape
                 if 0 <= row < h and 0 <= col < w:
                     elev = float(self.grids[name][row, col])
-                    # NoData 처리
                     if elev < -100: elev = 0.0
                     
                     self.cache[key] = elev
                     return elev
         
-        # 데이터가 없으면 기본값 (또는 가상 지형 생성 로직 연결 가능)
         self.cache[key] = 100.0
         return 100.0
 
@@ -96,7 +93,6 @@ class AStarPathfinder3DOptimized:
             MAP_BOUNDS["max_lon"],
         ]
 
-    # --- 좌표 변환 ---
     def to_grid_3d(self, lat, lon, alt):
         min_lat, max_lat, min_lon, max_lon = self.bounds
         y = int((lat - min_lat) / ((max_lat - min_lat) / self.grid_size))
@@ -111,7 +107,6 @@ class AStarPathfinder3DOptimized:
         alt = ALTITUDE_MIN + (z * ((ALTITUDE_MAX - ALTITUDE_MIN) / self.altitude_levels))
         return lat, lon, alt
 
-    # --- 유틸 ---
     def heuristic(self, a, b, alt_weight=0.1):
         dx, dy, dz = abs(a[0]-b[0]), abs(a[1]-b[1]), abs(a[2]-b[2])
         return math.sqrt(dx**2 + dy**2 + (dz * alt_weight)**2)
@@ -126,9 +121,7 @@ class AStarPathfinder3DOptimized:
             current = came_from[current]
         return path[::-1]
 
-    # --- 충돌 검사 ---
     def is_collision_3d(self, lat, lon, alt, threats, margin):
-        # [주의] pathfinder.py의 로직과 동일하게 유지해야 함 (여기서는 간소화 버전)
         margin_deg = margin / LAT_TO_KM
         for t in threats:
             if t["type"] in ["SAM", "RADAR"]:
@@ -137,19 +130,39 @@ class AStarPathfinder3DOptimized:
                     + ((lon - t["lon"]) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
                 )
                 
-                # 간단한 거리 체크
-                if dist_km < (t["radius_km"] + margin):
-                    # 저고도 침투 로직 (300m 이하 안전)
-                    try:
-                        elev = self.terrain.get(lat, lon)
-                        agl = alt - elev
-                    except:
-                        agl = 1000
+                threat_radius = t["radius_km"] + margin
+                if dist_km >= threat_radius:
+                    continue
                     
-                    if agl < 300: # 지형 은폐
-                        continue
+                if t["type"] == "SAM" and dist_km < t["radius_km"] * 0.3:
+                    return True
+                    
+                threat_alt = t.get("alt", 0)
+                if threat_alt == 0:
+                    try:
+                        threat_alt = self.terrain.get(t["lat"], t["lon"]) + 10
+                    except:
+                        threat_alt = 100
                         
-                    return True # 충돌
+                is_visible = check_line_of_sight(
+                    radar_pos=(t["lat"], t["lon"], threat_alt),
+                    aircraft_pos=(lat, lon, alt),
+                    terrain_loader=self.terrain
+                )
+                
+                if not is_visible:
+                    continue 
+                    
+                try:
+                    elev = self.terrain.get(lat, lon)
+                    agl = alt - elev
+                except:
+                    agl = 1000
+                    
+                if agl < 200:
+                    continue
+                    
+                return True 
                     
             elif t["type"] == "NFZ":
                 if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
@@ -157,9 +170,7 @@ class AStarPathfinder3DOptimized:
                     return True
         return False
 
-    # --- 메인 경로탐색 ---
     def find_path_3d_fast(self, start, end, threats, safety_margin):
-        # 2D 좌표면 고도 자동 할당
         if len(start) == 2:
             s_elev = self.terrain.get(*start)
             start = [*start, s_elev + 500]
@@ -173,7 +184,6 @@ class AStarPathfinder3DOptimized:
         open_set = [(0, start_grid)]
         came_from, g_score = {}, {start_grid: 0}
         
-        # 26방향 (상하좌우대각선)
         directions = [(dx, dy, dz) for dx in [-1,0,1] for dy in [-1,0,1] for dz in [-1,0,1] if not (dx==dy==dz==0)]
 
         nodes_explored = 0
@@ -181,7 +191,6 @@ class AStarPathfinder3DOptimized:
             current = heapq.heappop(open_set)[1]
             nodes_explored += 1
             
-            # 근접 도달 허용 (Grid 단위 2칸 이내)
             if self.distance(current, end_grid) < 2:
                 return self.reconstruct(came_from, current)
 
@@ -192,7 +201,6 @@ class AStarPathfinder3DOptimized:
             for dx, dy, dz in directions:
                 neighbor = (current[0]+dx, current[1]+dy, current[2]+dz)
                 
-                # 범위 체크
                 if not (0 <= neighbor[0] < self.grid_size and 
                         0 <= neighbor[1] < self.grid_size and 
                         0 <= neighbor[2] < self.altitude_levels):
@@ -200,16 +208,13 @@ class AStarPathfinder3DOptimized:
 
                 n_lat, n_lon, n_alt = self.to_latlonalt(*neighbor)
                 
-                # 지형 충돌 (AGL)
                 elev = self.terrain.get(n_lat, n_lon)
                 if n_alt < elev + MIN_ALTITUDE_AGL:
                     continue
                 
-                # 위협 충돌
                 if self.is_collision_3d(n_lat, n_lon, n_alt, threats, safety_margin):
                     continue
 
-                # 비용 계산
                 move_cost = math.sqrt(dx**2 + dy**2 + (dz * 0.5)**2)
                 tentative_g = g_score[current] + move_cost
                 

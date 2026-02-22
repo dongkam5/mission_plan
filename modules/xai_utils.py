@@ -1,11 +1,10 @@
 """
-XAI (Explainable AI) 유틸리티 - 레이더 음영 시각화 포함
+XAI (Explainable AI) 유틸리티 - 레이더 음영 시각화 포함 (최적화 반영)
 """
 import numpy as np
 import math
 from typing import List, Dict, Tuple
 from modules.config import HEATMAP_RESOLUTION, MAP_BOUNDS
-
 
 # [중요] 레이더 음영 체크 함수 임포트
 try:
@@ -13,46 +12,46 @@ try:
 except ImportError:
     def check_line_of_sight(*args, **kwargs): return True
 
-
 LAT_TO_KM = 110.57
-
 
 class XAIUtils:
     """XAI 관련 기능"""
    
     @staticmethod
-    def calculate_risk_score(lat: float, lon: float, threats: List[dict], margin: float, terrain_loader=None) -> float:
+    def calculate_risk_score(lat: float, lon: float, threats: List[dict], margin: float, terrain_loader=None, target_alt: float = None) -> float:
         """
-        특정 위치의 위험도 점수 계산 (음영 + SNR기반 Pd + Pk)
+        특정 위치의 위험도 점수 계산 (음영 + SNR기반 Pd + Pk + 독립시행 누적 확률)
         """
         if not threats:
             return 0.0
 
-        max_risk = 0.0
+        survival_prob = 1.0  # 생존 확률 (누적 연산용)
 
-        # 지형 고도 가져오기 (음영 계산용)
-        my_alt = 500  # 기본 비행 고도 가정 (히트맵용)
-        if terrain_loader:
-            try:
-                my_alt = terrain_loader.get_elevation(lat, lon) + 500  # AGL 200m 가정
-            except:
-                pass
+        # 타겟 고도 설정 (입력 없으면 지형 + 500m AGL 가정)
+        if target_alt is None:
+            target_alt = 500
+            if terrain_loader:
+                try:
+                    target_alt = terrain_loader.get_elevation(lat, lon) + 500
+                except:
+                    pass
 
         for t in threats:
-            # SAM 또는 RADAR
+            risk = 0.0
+            
+            # (1) SAM 또는 RADAR
             if t["type"] in ["SAM", "RADAR"]:
                 dist_km = math.sqrt(
                     ((lat - t["lat"]) * LAT_TO_KM) ** 2 +
                     ((lon - t["lon"]) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
                 )
+                threat_radius = float(t.get("radius_km", 0))
 
-                threat_radius = float(t["radius_km"])  # 여기서는 '교전 최대거리 R_E'로 사용
-
-                # 1. 거리상 안전하면 패스
+                # 거리상 완전 안전하면 패스
                 if dist_km >= threat_radius + margin:
                     continue
 
-                # 2. 레이더 음영 체크(LOS)
+                # 레이더 음영 체크(LOS)
                 if terrain_loader:
                     threat_alt = float(t.get("alt", 0))
                     if threat_alt == 0:
@@ -63,40 +62,29 @@ class XAIUtils:
 
                     is_visible = check_line_of_sight(
                         radar_pos=(t["lat"], t["lon"], threat_alt),
-                        aircraft_pos=(lat, lon, my_alt),
+                        aircraft_pos=(lat, lon, target_alt),
                         terrain_loader=terrain_loader,
                         samples=5
                     )
                     if not is_visible:
-                        continue
+                        continue  # 지형에 가려지면 이 위협에 대해서는 위험도 0
 
-                # -------------------------
-                # 3. 위험도 산출 (P_D * P_K)
-                # -------------------------
-
-                # (A) P_D: SNR 기반 탐지확률 (received power ~ 1/R^4)
+                # P_D: SNR 기반 탐지확률
                 R_E = threat_radius
-                R_D = R_E + margin  # <- 요청대로 threat_radius+margin으로 RD 정의
-
+                R_D = R_E + margin
                 loss = float(t.get("loss", 3.0))
                 rcs_m2 = float(t.get("rcs_m2", 5.0))
                 pd_k = float(t.get("pd_k", 0.15))
 
-                # 목표: RD에서 Pd=0.1
                 PD_AT_RD = 0.1
-                logit_pd = math.log(PD_AT_RD / (1.0 - PD_AT_RD))  # ~ -2.197...
-
-                # 기준: pd_th_db를 0으로 두고(임계 기준점), RD에서 필요한 snr_db를 결정
+                logit_pd = math.log(PD_AT_RD / (1.0 - PD_AT_RD))
                 pd_th_db = 0.0
-                snr_req_db_at_rd = pd_th_db + (logit_pd / max(pd_k, 1e-9))  # 음수값 나옴
-
-                # RD에서 snr_db == snr_req_db_at_rd 되도록 snr0 역산
-                d_ref_m = max(1.0, R_D * 1000.0)
+                snr_req_db_at_rd = pd_th_db + (logit_pd / max(pd_k, 1e-9))
                 snr_req_linear = 10.0 ** (snr_req_db_at_rd / 10.0)
 
+                d_ref_m = max(1.0, R_D * 1000.0)
                 snr0 = snr_req_linear * (d_ref_m ** 4) * (loss / max(rcs_m2, 1e-12))
 
-                # 이제 현재 거리에서 Pd 계산
                 d_m = max(1.0, dist_km * 1000.0)
                 snr = snr0 * (rcs_m2 / loss) / (d_m ** 4)
                 snr_db = 10.0 * math.log10(max(snr, 1e-30))
@@ -104,7 +92,7 @@ class XAIUtils:
                 P_D = 1.0 / (1.0 + math.exp(-pd_k * (snr_db - pd_th_db)))
                 P_D = max(0.0, min(1.0, P_D))
 
-                # (B) P_K: 사거리 내에서 거리 기반 피격확률(가우시안)
+                # P_K: 피격확률 (가우시안)
                 if dist_km >= R_E:
                     P_K = 0.0
                 else:
@@ -116,33 +104,29 @@ class XAIUtils:
                 weight = float(t.get("weight", 1.0))
                 risk = weight * (P_D * P_K)
 
-                max_risk = max(max_risk, risk)
-
-            # NFZ
+            # (2) NFZ (비행금지구역)
             elif t["type"] == "NFZ":
-                margin_deg = margin / LAT_TO_KM
-                if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
-                    (t["lon_min"] - margin_deg <= lon <= t["lon_max"] + margin_deg)):
-                    if (t["lat_min"] <= lat <= t["lat_max"] and
-                        t["lon_min"] <= lon <= t["lon_max"]):
-                        risk = 1.0
-                    else:
-                        risk = 0.5
-                    max_risk = max(max_risk, risk)
+                inside = (t["lat_min"] <= lat <= t["lat_max"] and t["lon_min"] <= lon <= t["lon_max"])
+                if inside:
+                    weight = float(t.get("weight", 1.0))
+                    risk = weight * 1.0 
+                else:
+                    risk = 0.0
 
-        return min(max_risk, 1.0)
+            # 누적 생존 확률 계산 (결합 법칙)
+            risk = max(0.0, min(1.0, risk))
+            survival_prob *= (1.0 - risk)
+
+        # 전체 위험도 = 1 - 최종 생존 확률
+        total_risk = 1.0 - survival_prob
+        return total_risk
     
     @staticmethod
     def generate_heatmap_data(threats: List[dict], margin: float, terrain_loader=None) -> List[Tuple[float, float, float]]:
-        """
-        위협 히트맵 데이터 생성 (지형 로더 받아서 음영 처리)
-        """
         min_lat, max_lat = MAP_BOUNDS["min_lat"], MAP_BOUNDS["max_lat"]
         min_lon, max_lon = MAP_BOUNDS["min_lon"], MAP_BOUNDS["max_lon"]
         
         heatmap_data = []
-        
-        # 해상도 조정 (너무 느리면 HEATMAP_RESOLUTION을 40정도로 낮추세요)
         step_lat = (max_lat - min_lat) / HEATMAP_RESOLUTION
         step_lon = (max_lon - min_lon) / HEATMAP_RESOLUTION
         
@@ -151,7 +135,6 @@ class XAIUtils:
                 lat = min_lat + i * step_lat
                 lon = min_lon + j * step_lon
                 
-                # terrain_loader를 넘겨줘야 음영 계산이 됨
                 risk = XAIUtils.calculate_risk_score(lat, lon, threats, margin, terrain_loader)
                 
                 if risk > 0.01:
@@ -160,8 +143,7 @@ class XAIUtils:
         return heatmap_data
     
     @staticmethod
-    def analyze_path_risk(path: List[Tuple[float, float]], threats: List[dict], margin: float) -> Dict:
-        # (기존 코드 유지)
+    def analyze_path_risk(path: List[Tuple], threats: List[dict], margin: float, terrain_loader=None) -> Dict:
         if not path:
             return {"avg_risk": 0, "max_risk": 0, "high_risk_segments": 0, "total_length_km": 0}
         
@@ -169,10 +151,11 @@ class XAIUtils:
         total_length = 0.0
         high_risk_count = 0
         
-        for i, (lat, lon) in enumerate(path):
-            # 경로 분석은 정밀하게 하되, 여기서는 지형 로더 없이 거리 기반으로만 빠르게 (옵션)
-            # 필요하면 terrain_loader 추가 가능
-            risk = XAIUtils.calculate_risk_score(lat, lon, threats, margin) 
+        for i, p in enumerate(path):
+            lat, lon = p[0], p[1]
+            target_alt = p[2] if len(p) == 3 else None 
+            
+            risk = XAIUtils.calculate_risk_score(lat, lon, threats, margin, terrain_loader, target_alt=target_alt) 
             risks.append(risk)
             
             if risk > 0.7: high_risk_count += 1

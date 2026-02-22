@@ -3,6 +3,8 @@
 - UI 복구: STPT 리스트 및 다운로드 버튼 재등장
 - 시각화 개선: SAM(로켓), RADAR(와이파이) 아이콘 적용
 - 음영 반영: 히트맵에 지형 음영 적용
+- AI 인지 개선: LLM에 경로 위험도(Path Analysis) 연동
+- UI 버그 수정: 위협 추가 라디오 버튼 즉각 반응 (form 외부로 분리)
 """
 import streamlit as st
 import folium
@@ -29,7 +31,7 @@ if "mission" not in st.session_state:
     st.session_state.mission = MissionState()
 
 if "terrain" not in st.session_state:
-    with st.spinner("🌍 지형 데이터 메모리 적재 중... (최초 1회)"):
+    with st.spinner("🌍 지형 데이터 메모 적재 중... (최초 1회)"):
         base_loader = TerrainLoader()
         st.session_state.terrain = TerrainCacheFast(base_loader)
 
@@ -78,7 +80,19 @@ with col_left:
             mission.add_chat_message("user", user_input)
             with st.spinner("🧠 AI 분석 중..."):
                 brain = LLMBrain()
-                path_analysis = None # (간소화)
+                
+                # 세션에 저장된 현재 경로가 있다면 분석 후 LLM에 전달
+                path_analysis = None
+                current_path = st.session_state.get("current_path")
+                if current_path:
+                    threats_dict = [t.to_dict() for t in mission.threats]
+                    path_analysis = XAIUtils.analyze_path_risk(
+                        current_path, 
+                        threats_dict, 
+                        mission.params.margin, 
+                        terrain_loader=terrain_fast
+                    )
+                
                 result = brain.parse_tactical_command(user_input, mission.params.to_dict(), path_analysis)
                 
                 if result["action"] == "UPDATE":
@@ -97,19 +111,28 @@ with col_left:
     # 2. 위협 관리
     with tab_intel:
         st.subheader("위협 추가")
+        
+        # [수정된 부분] 라디오 버튼을 st.form 바깥으로 빼서 화면 즉각 갱신
+        add_type = st.radio('유형', ["원형 (SAM)", "레이더 (RADAR)", "사각형 (NFZ)"], horizontal=True)
+        
         with st.form("threat_form"):
-            add_type = st.radio('유형', ["원형 (SAM)", "레이더 (RADAR)", "사각형 (NFZ)"], horizontal=True)
             t_name = st.text_input("명칭", value=f"Threat-{len(mission.threats)+1:02d}")
             c1, c2 = st.columns(2)
-            t_lat = c1.number_input("Lat", 33.0, 43.0, 38.0, key="t_lat")
-            t_lon = c2.number_input("Lon", 124.0, 132.0, 127.0, key="t_lon")
-            t_rad = st.slider("반경(km)", 5, 200, 30, key="t_rad")
             
-            # NFZ Inputs
-            l_min = c1.number_input("Min Lat", 33.0, 43.0, 37.5) if "NFZ" in add_type else 0
-            l_max = c2.number_input("Max Lat", 33.0, 43.0, 37.8) if "NFZ" in add_type else 0
-            ln_min = c1.number_input("Min Lon", 124.0, 132.0, 127.5) if "NFZ" in add_type else 0
-            ln_max = c2.number_input("Max Lon", 124.0, 132.0, 127.8) if "NFZ" in add_type else 0
+            # NFZ가 선택되었을 때
+            if "NFZ" in add_type:
+                l_min = c1.number_input("Min Lat", 33.0, 43.0, 37.5)
+                l_max = c2.number_input("Max Lat", 33.0, 43.0, 37.8)
+                ln_min = c1.number_input("Min Lon", 124.0, 132.0, 127.5)
+                ln_max = c2.number_input("Max Lon", 124.0, 132.0, 127.8)
+                t_lat, t_lon, t_rad = 0, 0, 0 # 에러 방지용 더미값
+            
+            # SAM 또는 RADAR가 선택되었을 때
+            else:
+                t_lat = c1.number_input("Lat", 33.0, 43.0, 38.0, key="t_lat")
+                t_lon = c2.number_input("Lon", 124.0, 132.0, 127.0, key="t_lon")
+                t_rad = st.slider("반경(km)", 5, 200, 30, key="t_rad")
+                l_min, l_max, ln_min, ln_max = 0, 0, 0, 0 # 에러 방지용 더미값
 
             if st.form_submit_button("➕ 위협 추가"):
                 if "NFZ" in add_type:
@@ -200,7 +223,11 @@ with col_right:
         final_out = smooth_path_3d(raw_out) if (raw_out and len(raw_out[0])==3) else smooth_path(raw_out)
 
     calc_time = time.time() - start_time
-    st.session_state.current_path = final_in
+    
+    # 평가를 위해 전체 경로를 세션에 저장
+    combined_path = final_in + final_out if final_out else final_in
+    st.session_state.current_path = combined_path
+    
     st.caption(f"⏱️ 계산 시간: {calc_time:.3f}초")
 
     # ===== 지도 시각화 =====
@@ -209,17 +236,14 @@ with col_right:
     folium.Marker(start_coord[:2], icon=folium.Icon(color="blue", icon="plane"), tooltip="Start").add_to(m)
     folium.Marker(target_coord[:2], icon=folium.Icon(color="red", icon="crosshairs", prefix="fa"), tooltip="Target").add_to(m)
 
-    # [수정] 위협 아이콘 적용
     for t in mission.threats:
         color = "crimson" if t.type == "SAM" else ("purple" if t.type == "RADAR" else "orange")
         
         if t.type == "NFZ":
             folium.Rectangle([[t.lat_min, t.lon_min], [t.lat_max, t.lon_max]], color=color, fill=True).add_to(m)
         else:
-            # 원 그리기
             folium.Circle([t.lat, t.lon], radius=t.radius_km*1000, color=color, fill=True, fill_opacity=0.2).add_to(m)
             
-            # 중앙 아이콘 (로켓/와이파이)
             icon_name = "rocket" if t.type == "SAM" else "wifi"
             folium.Marker(
                 [t.lat, t.lon],
@@ -234,20 +258,18 @@ with col_right:
 
     # 히트맵 (음영 반영)
     if 'show_heatmap' in locals() and show_heatmap and mission.threats:
-        # [핵심] terrain_fast를 넘겨줘서 음영 계산 수행
         h_data = XAIUtils.generate_heatmap_data(threats_dict, mission.params.margin, terrain_loader=terrain_fast)
         if h_data: HeatMap(h_data, radius=15, blur=20, min_opacity=0.2).add_to(m)
 
     st_folium(m, width="100%", height=700, returned_objects=[])
 
-    # ===== [복구 완료] STPT 테이블 및 다운로드 =====
+    # ===== STPT 테이블 및 다운로드 =====
     if final_in:
         st.divider()
         st.subheader("📋 Steer Point List")
         
         gap = mission.params.stpt_gap
         data_in = []
-        # 3D/2D 분기 처리
         for i, p in enumerate(final_in[::gap]):
             pt = {"Type": "Ingress", "Seq": i+1, "Lat": f"{p[0]:.4f}", "Lon": f"{p[1]:.4f}"}
             if len(p) == 3: pt["Alt(m)"] = f"{p[2]:.0f}"
