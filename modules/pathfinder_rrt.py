@@ -10,6 +10,7 @@ RRT / RRT* 경로탐색 알고리즘 (lat, lon 기반)
 import math
 import random
 from typing import List, Tuple, Optional
+from modules.xai_utils import XAIUtils
 
 # NOTE: 사용 중인 설정값들
 from modules.config import GRID_SIZE, MAP_BOUNDS, ALTITUDE_MIN, ALTITUDE_MAX  # noqa: F401
@@ -50,27 +51,24 @@ class RRTPathfinder:
             + ((node1.lon - node2.lon) * 111.0 * math.cos(math.radians(node1.lat))) ** 2
         )
 
+    # [수정 부분] is_collision 함수 내부
     def is_collision(self, node: RRTNode, threats: List[dict], margin_km: float) -> bool:
-        """충돌 체크 (node 한 점이 위협영역/금지구역에 들어가는지)"""
+        """충돌 체크 (NFZ Strict + 위협 점수 0.5 적용)"""
+        # 1. NFZ 충돌 체크 (Strict)
         margin_deg = margin_km / 111.0
-
         for t in threats:
-            if t["type"] == "SAM":
-                dist_km = math.sqrt(
-                    ((node.lat - t["lat"]) * 111.0) ** 2
-                    + ((node.lon - t["lon"]) * 111.0 * math.cos(math.radians(node.lat))) ** 2
-                )
-                if dist_km < (t["radius_km"] + margin_km):
+            if t["type"] == "NFZ":
+                if ((t["lat_min"] - margin_deg <= node.lat <= t["lat_max"] + margin_deg) and
+                    (t["lon_min"] - margin_deg <= node.lon <= t["lon_max"] + margin_deg)):
                     return True
 
-            elif t["type"] == "NFZ":
-                if (
-                    (t["lat_min"] - margin_deg <= node.lat <= t["lat_max"] + margin_deg)
-                    and (t["lon_min"] - margin_deg <= node.lon <= t["lon_max"] + margin_deg)
-                ):
-                    return True
-
-        return False
+        # 2. SAM/RADAR 충돌 체크 (Risk Score >= 0.5)
+        # 3D 고도 정보를 포함하여 XAI 위협 점수 산출
+        risk_score = XAIUtils.calculate_risk_score(
+            node.lat, node.lon, threats, margin_km, 
+            target_alt=node.alt if node.alt > 0 else None
+        )
+        return risk_score >= 0.5
 
     def is_path_clear(
         self, node1: RRTNode, node2: RRTNode, threats: List[dict], margin_km: float, steps: int = 10

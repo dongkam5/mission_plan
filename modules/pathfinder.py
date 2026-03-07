@@ -6,6 +6,7 @@ import heapq
 import numpy as np
 from scipy.interpolate import splprep, splev
 from typing import List, Tuple, Optional
+from modules.xai_utils import XAIUtils
 from modules.config import GRID_SIZE, MAP_BOUNDS, SMOOTHING_FACTOR, ALTITUDE_LEVELS, ALTITUDE_MIN, ALTITUDE_MAX, MIN_ALTITUDE_AGL
 
 # [핵심] 레이더 음영 계산 모듈 임포트
@@ -45,20 +46,23 @@ class AStarPathfinder:
         return lat, lon
     
     def is_collision(self, lat: float, lon: float, threats: List[dict], margin: float) -> bool:
-        margin_deg = margin / LAT_TO_KM
-        for t in threats:
-            if t['type'] in ["SAM", "RADAR"]: # 2D에서는 레이더도 반경으로 처리
-                dist_km = math.sqrt(
-                    ((lat - t['lat']) * LAT_TO_KM) ** 2 + 
-                    ((lon - t['lon']) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
-                )
-                if dist_km < (t['radius_km'] + margin):
-                    return True
-            elif t['type'] == "NFZ":
-                if ((t['lat_min'] - margin_deg <= lat <= t['lat_max'] + margin_deg) and
-                    (t['lon_min'] - margin_deg <= lon <= t['lon_max'] + margin_deg)):
-                    return True
-        return False
+            """
+            2D 충돌 검사 로직 (v2.8)
+            - NFZ: 엄격한 차단 (Strict)
+            - SAM/RADAR: 위협 점수 0.5 이상일 때만 충돌로 간주
+            """
+            # 1. NFZ: 마진 포함 조금이라도 겹치면 무조건 충돌
+            margin_deg = margin / LAT_TO_KM
+            for t in threats:
+                if t.get("type") == "NFZ":
+                    if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
+                        (t["lon_min"] - margin_deg <= lon <= t["lon_max"] + margin_deg)):
+                        return True
+            
+            # 2. SAM/RADAR: 위협 점수 0.5 이상일 때만 충돌로 간주
+            # 2D 알고리즘이라도 리스크 계산은 3D(지형+500m)로 수행하여 정확성 유지
+            risk_score = XAIUtils.calculate_risk_score(lat, lon, threats, margin)
+            return risk_score >= 0.5
     
     def find_path(self, start: List[float], end: List[float], threats: List[dict], safety_margin: float) -> List[Tuple[float, float]]:
         start_grid = self.to_grid(start[0], start[1])
@@ -127,67 +131,25 @@ class AStarPathfinder3D:
         return lat, lon, alt
     
     def is_collision_3d(self, lat: float, lon: float, alt: float, threats: List[dict], margin: float) -> bool:
-        """3D 충돌 체크 (SAM / RADAR / NFZ 분기)"""
-        
-        # 현재 위치의 지형 고도 (AGL 계산용)
-        try:
-            terrain_h = self.terrain.get_elevation(lat, lon)
-        except:
-            terrain_h = 0
-        agl = alt - terrain_h  # AGL (Above Ground Level)
-        margin_deg = margin / LAT_TO_KM
-
-        for t in threats:
-            # 1. NFZ (비행금지구역) - 고도 불문 금지
-            if t['type'] == "NFZ":
-                if ((t['lat_min'] - margin_deg <= lat <= t['lat_max'] + margin_deg) and
-                    (t['lon_min'] - margin_deg <= lon <= t['lon_max'] + margin_deg)):
-                    return True
-
-            # 2. SAM (미사일) 및 RADAR (레이더)
-            elif t['type'] in ["SAM", "RADAR"]:
-                dist_km = math.sqrt(
-                    ((lat - t['lat']) * LAT_TO_KM) ** 2 + 
-                    ((lon - t['lon']) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
-                )
-                threat_radius = t['radius_km'] + margin
-                
-                # 반경 밖이면 안전
-                if dist_km >= threat_radius:
-                    continue
-
-                # --- [A] SAM 특수 로직 (Kill Zone) ---
-                if t['type'] == "SAM":
-                    # SAM 바로 위(30%)는 광학 조준되므로 무조건 위험
-                    kill_zone = t['radius_km'] * 0.3
-                    if dist_km < kill_zone:
+            """
+            3D 충돌 검사 로직 (v2.8)
+            - NFZ: 엄격한 차단
+            - SAM/RADAR: 3D 고도 반영 위협 점수 0.5 임계치 적용
+            """
+            # 1. NFZ: 엄격한 차단
+            margin_deg = margin / LAT_TO_KM
+            for t in threats:
+                if t.get("type") == "NFZ":
+                    if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
+                        (t["lon_min"] - margin_deg <= lon <= t["lon_max"] + margin_deg)):
                         return True
 
-                # --- [B] 공통 로직 (Radar Line-of-Sight) ---
-                # 위협의 안테나 높이 (설정 없으면 지형 + 10m)
-                threat_alt = t.get('alt', 0)
-                if threat_alt == 0:
-                    threat_alt = self.terrain.get_elevation(t['lat'], t['lon']) + 10
-
-                # 레이더 음영 체크 (Shadow Check)
-                is_visible = check_line_of_sight(
-                    radar_pos=(t['lat'], t['lon'], threat_alt),
-                    aircraft_pos=(lat, lon, alt),
-                    terrain_loader=self.terrain
-                )
-                
-                if not is_visible:
-                    # 산에 가려짐 -> 탐지 안 됨 -> 안전
-                    continue 
-                
-                # 레이더에 보임. 하지만 초저고도(AGL < 200m)면 지형 클러터로 회피 인정
-                if agl < 200:
-                    continue
-
-                # 여기까지 오면 탐지/격추됨
-                return True
-        
-        return False
+            # 2. SAM/RADAR: 3D 고도 반영 리스크 체크 (Threshold 0.5)
+            risk_score = XAIUtils.calculate_risk_score(
+                lat, lon, threats, margin, 
+                terrain_loader=self.terrain, target_alt=alt
+            )
+            return risk_score >= 0.5
     
     def is_terrain_collision(self, lat: float, lon: float, alt: float) -> bool:
         """지형 충돌 체크"""

@@ -8,6 +8,7 @@ import math
 import heapq
 import numpy as np
 from typing import List, Tuple
+from modules.xai_utils import XAIUtils
 from modules.config import MAP_BOUNDS, GRID_SIZE, ALTITUDE_MIN, ALTITUDE_MAX, MIN_ALTITUDE_AGL
 
 LAT_TO_KM = 110.57
@@ -126,50 +127,28 @@ class AStarPathfinder3DOptimized:
             current = came_from[current]
         return path[::-1]
 
-    # --- 충돌 검사 ---
+    # [수정 부분] is_collision_3d 함수 내부
     def is_collision_3d(self, lat, lon, alt, threats, margin):
         """
         3D 위협 충돌 검사:
-        - SAM: 반경 + 마진 이내 AND 충분히 높으면 충돌 (저고도 침투로 회피 가능)
-        - RADAR: 반경 + 마진 이내이지만 저고도(AGL < LOW_ALT_THRESHOLD)면 회피
-        - NFZ: 항상 충돌
+        - NFZ: 마진 포함 조금이라도 겹치면 즉시 충돌 (Strict)
+        - SAM/RADAR: XAI 위협 점수가 0.5 이상일 때만 충돌로 간주
         """
+        # 1. NFZ: 절대 진입 금지 (Strict Collision)
         margin_deg = margin / LAT_TO_KM
-        # 저고도 회피 임계값: RADAR는 400m AGL 이하면 레이더 음영 (SAM은 더 낮은 200m)
-        RADAR_SHADOW_AGL = 400.0  # RADAR 회피 최대 고도
-        SAM_SHADOW_AGL   = 200.0  # SAM 회피 최대 고도 (거의 초저공)
-
-        try:
-            elev = self.terrain.get(lat, lon)
-        except Exception:
-            elev = 0.0
-        agl = alt - elev
-
         for t in threats:
-            t_type = t.get("type", "")
-            if t_type in ("SAM", "RADAR"):
-                dist_km = math.sqrt(
-                    ((lat - t["lat"]) * LAT_TO_KM) ** 2
-                    + ((lon - t["lon"]) * LAT_TO_KM * math.cos(math.radians(lat))) ** 2
-                )
-                effective_r = t["radius_km"] + margin
-                if dist_km < effective_r:
-                    # RADAR: 저고도 침투 허용 (레이더 음영 활용)
-                    if t_type == "RADAR":
-                        if agl < RADAR_SHADOW_AGL:
-                            continue  # 저고도 → 충돌 아님
-                        return True  # 고고도는 충돌
-                    # SAM: 매우 낮은 고도에서만 회피
-                    else:  # SAM
-                        if agl < SAM_SHADOW_AGL:
-                            continue  # 초저공 회피
-                        return True  # 일반 고도는 충돌
-
-            elif t_type == "NFZ":
+            if t.get("type") == "NFZ":
                 if ((t["lat_min"] - margin_deg <= lat <= t["lat_max"] + margin_deg) and
                     (t["lon_min"] - margin_deg <= lon <= t["lon_max"] + margin_deg)):
                     return True
-        return False
+        
+        # 2. 전술 위협: 위험 점수 기반 충돌 판단 (Threshold 0.5)
+        # XAIUtils를 호출하여 3D 거리와 음영을 모두 고려한 점수 확인
+        risk_score = XAIUtils.calculate_risk_score(
+            lat, lon, threats, margin, 
+            terrain_loader=self.terrain, target_alt=alt
+        )
+        return risk_score >= 0.5
 
     # --- 메인 경로탐색 ---
     def find_path_3d_fast(self, start, end, threats, safety_margin):

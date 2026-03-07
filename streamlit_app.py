@@ -10,9 +10,10 @@ from streamlit_folium import st_folium
 from folium.plugins import HeatMap
 import pandas as pd
 import time
+import json
 
 from modules.config import AIRPORTS, MAP_CENTER, MAP_ZOOM, CHAT_CONTAINER_HEIGHT, AVAILABLE_ALGORITHMS, FORMATION_MAX_TOTAL
-from modules.mission_state import MissionState, Threat
+from modules.mission_state import MissionState, Threat, THREAT_DB
 from modules.llm_brain import LLMBrain
 from modules.formation_optimizer import FormationOptimizer
 from modules.validator import MissionValidator
@@ -173,38 +174,131 @@ with col_left:
                 mission.add_chat_message("assistant", ai_msg, result.get("reasoning", ""))
                 st.rerun()
 
-    # 2. 위협 관리
+    # 2. 위협 관리 (v2.1: 군사 DB 선택 + 수동 설정 통합)
     with tab_intel:
         st.subheader("위협 추가")
-        with st.form("threat_form"):
-            add_type = st.radio('유형', ["원형 (SAM)", "레이더 (RADAR)", "사각형 (NFZ)"], horizontal=True)
-            t_name = st.text_input("명칭", value=f"Threat-{len(mission.threats)+1:02d}")
-            c1, c2 = st.columns(2)
-            t_lat = c1.number_input("Lat", 33.0, 43.0, 38.0, key="t_lat")
-            t_lon = c2.number_input("Lon", 124.0, 132.0, 127.0, key="t_lon")
-            t_rad = st.slider("반경(km)", 5, 200, 30, key="t_rad")
-            
-            # NFZ Inputs
-            l_min = c1.number_input("Min Lat", 33.0, 43.0, 37.5) if "NFZ" in add_type else 0
-            l_max = c2.number_input("Max Lat", 33.0, 43.0, 37.8) if "NFZ" in add_type else 0
-            ln_min = c1.number_input("Min Lon", 124.0, 132.0, 127.5) if "NFZ" in add_type else 0
-            ln_max = c2.number_input("Max Lon", 124.0, 132.0, 127.8) if "NFZ" in add_type else 0
 
-            if st.form_submit_button("➕ 위협 추가"):
-                if "NFZ" in add_type:
-                    mission.add_threat(Threat(name=t_name, type="NFZ", lat_min=l_min, lat_max=l_max, lon_min=ln_min, lon_max=ln_max))
-                else:
+        # ── 라디오: form 바깥에 위치 (클릭 즉시 반응)
+        add_type = st.radio(
+            '위협 입력 방식',
+            ["군사 DB (SAM/RADAR)", "수동 설정 (SAM/RADAR)", "수동 설정 (NFZ)"],
+            horizontal=True
+        )
+
+        with st.form("threat_form"):
+            # ── 방식 1: 군사 DB 선택 ───────────────────────────────
+            if add_type == "군사 DB (SAM/RADAR)":
+                selected_db = st.selectbox(
+                    "적성 체계 식별명",
+                    list(THREAT_DB.keys()),
+                    help="F-16 전투기 대응 기준 현실화 파라미터 자동 적용"
+                )
+                db_preview = THREAT_DB[selected_db]
+                st.caption(
+                    f"▸ 유형: {db_preview['type']} "
+                    f"| 반경: {db_preview['radius_km']} km "
+                    f"| SSKP: {db_preview['sskp']:.0%}"
+                )
+                t_name = st.text_input(
+                    "전술 지도 표시 명칭",
+                    value=f"{selected_db.split()[0]}-{len(mission.threats)+1:02d}"
+                )
+
+            # ── 방식 2: 수동 설정 (SAM/RADAR) ─────────────────────
+            elif add_type == "수동 설정 (SAM/RADAR)":
+                manual_type = st.radio("위협 유형", ["SAM", "RADAR"], horizontal=True)
+                t_name = st.text_input(
+                    "전술 지도 표시 명칭",
+                    value=f"Threat-{len(mission.threats)+1:02d}"
+                )
+
+            # ── 방식 3: NFZ ────────────────────────────────────────
+            else:
+                t_name = st.text_input(
+                    "비행금지구역 명칭",
+                    value=f"NFZ-{len(mission.threats)+1:02d}"
+                )
+
+            # ── 공통: 좌표 입력 ────────────────────────────────────
+            c1, c2 = st.columns(2)
+            t_lat = c1.number_input("Lat (위도)",  33.0, 43.0,  38.0, format="%.4f", key="t_lat")
+            t_lon = c2.number_input("Lon (경도)", 124.0, 132.0, 127.0, format="%.4f", key="t_lon")
+
+            # ── 수동 설정 반경 슬라이더 ────────────────────────────
+            if add_type == "수동 설정 (SAM/RADAR)":
+                t_rad = st.slider("반경(km)", 5, 400, 30, key="t_rad")
+
+            # ── NFZ 범위 입력 ──────────────────────────────────────
+            if add_type == "수동 설정 (NFZ)":
+                l_min  = c1.number_input("Min Lat", 33.0, 43.0,  37.5, format="%.4f")
+                l_max  = c2.number_input("Max Lat", 33.0, 43.0,  37.8, format="%.4f")
+                ln_min = c1.number_input("Min Lon", 124.0, 132.0, 127.5, format="%.4f")
+                ln_max = c2.number_input("Max Lon", 124.0, 132.0, 127.8, format="%.4f")
+
+            if st.form_submit_button("➕ 위협 추가", type="primary"):
+                ground_elev = 0.0
+                try:
                     ground_elev = terrain_fast.get_elevation(t_lat, t_lon)
-                    type_code = "RADAR" if "RADAR" in add_type else "SAM"
-                    mission.add_threat(Threat(name=t_name, type=type_code, lat=t_lat, lon=t_lon, radius_km=t_rad, alt=ground_elev + 10.0))
+                except Exception:
+                    pass
+
+                # ── NFZ 추가 ──────────────────────────────────────
+                if add_type == "수동 설정 (NFZ)":
+                    mission.add_threat(Threat(
+                        name=t_name, type="NFZ",
+                        lat_min=l_min, lat_max=l_max,
+                        lon_min=ln_min, lon_max=ln_max
+                    ))
+
+                # ── 군사 DB 추가 (정밀 XAI 파라미터 자동 적용) ────
+                elif add_type == "군사 DB (SAM/RADAR)":
+                    db_info = THREAT_DB[selected_db]
+                    r_km = db_info["radius_km"]
+                    mission.add_threat(Threat(
+                        name=t_name,
+                        type=db_info["type"],
+                        lat=t_lat,
+                        lon=t_lon,
+                        radius_km=r_km,
+                        alt=ground_elev + 10.0,
+                        loss=db_info["loss"],
+                        rcs_m2=db_info["rcs_m2"],
+                        pd_k=db_info["pd_k"],
+                        sskp=db_info["sskp"],
+                        pk_peak_km=r_km * db_info["peak_ratio"],
+                        pk_sigma_km=r_km * db_info["sigma_ratio"],
+                    ))
+
+                # ── 수동 SAM/RADAR 추가 ────────────────────────────
+                else:
+                    if manual_type == "RADAR":
+                        peak, sigma, sskp_val = 0.0, 0.0, 0.0
+                    else:
+                        peak      = t_rad * 0.35
+                        sigma     = t_rad * 0.20
+                        sskp_val  = 0.75
+                    mission.add_threat(Threat(
+                        name=t_name,
+                        type=manual_type,
+                        lat=t_lat,
+                        lon=t_lon,
+                        radius_km=t_rad,
+                        alt=ground_elev + 10.0,
+                        loss=8.0,
+                        rcs_m2=2.5,
+                        pd_k=0.4,
+                        sskp=sskp_val,
+                        pk_peak_km=peak,
+                        pk_sigma_km=sigma,
+                    ))
                 st.rerun()
 
         st.divider()
         if mission.threats:
             threat_df = pd.DataFrame([t.to_dict() for t in mission.threats])
-            cols = [c for c in ['name', 'type', 'radius_km', 'lat', 'lon', 'alt'] if c in threat_df.columns]
+            cols = [c for c in ['name', 'type', 'radius_km', 'lat', 'lon', 'sskp'] if c in threat_df.columns]
             st.dataframe(threat_df[cols], hide_index=True, width="stretch")
-            
+
             c_del, c_btn = st.columns([3, 1])
             del_name = c_del.selectbox("삭제할 위협", [t.name for t in mission.threats])
             if c_btn.button("🗑️ 삭제"):
@@ -601,8 +695,43 @@ with col_right:
             final_out = smooth_path_3d(raw_out) if (raw_out and len(raw_out[0]) == 3) else smooth_path(raw_out)
 
     calc_time = time.time() - start_time
-    st.session_state.current_path = final_in
-    st.caption(f"⏱️ 계산 시간: {calc_time:.3f}초")
+    # 내보내기 버튼이 찾는 이름인 'final_in'으로 저장합니다.
+    st.session_state['final_in'] = final_in  
+    st.session_state.current_path = final_in # 기존 코드 호환을 위해 유지    st.caption(f"⏱️ 계산 시간: {calc_time:.3f}초")
+    
+    # [수정/추가 부분] ⏱️ 계산 시간 출력(st.caption) 바로 아래에 삽입
+
+    # ── 요구사항 2: 실시간 경로 위험도 분석 리포트 표기 ──
+    if final_in:
+        # Ingress + Egress 전체 경로 분석 (항상 3D 거리 기반)
+        risk_report = XAIUtils.analyze_path_risk(
+            final_in + final_out, 
+            threats_dict, 
+            mission.params.margin, 
+            terrain_loader=terrain_fast
+        )
+        
+        st.divider()
+        st.markdown("### 📊 실시간 경로 위험도 분석 (3D Dominant Risk)")
+        m1, m2, m3, m4 = st.columns(4)
+        
+        # 요구사항 3: 지배적 위협 모델(Max) 기반 점수 표기
+        m1.metric("지배적 위협 점수", f"{risk_report['max_risk']:.2f}", 
+                  delta="🔴 고위험" if risk_report['max_risk'] > 0.7 else None, delta_color="inverse")
+        m2.metric("평균 노출 위험", f"{risk_report['avg_risk']:.2f}")
+        m3.metric("치명적 구간 수", f"{risk_report['high_risk_segments']}개")
+        m4.metric("3D 실비행거리", f"{risk_report['total_length_km']:.1f}km")
+
+        # 분석 결과에 따른 전술 권고
+        if risk_report['max_risk'] >= 1.0:
+            st.error("🚨 **작전 불가**: NFZ 침범 또는 치명적 위협이 감지되었습니다.")
+        elif risk_report['max_risk'] > 0.7:
+            st.error("🚨 **위험**: 피격 확률이 임계치(0.7)를 초과했습니다.")
+        else:
+            st.success("✅ **양호**: 계획된 경로의 위협 수준이 통제 범위 내에 있습니다.")
+    # ── 여기까지 추가 ──
+
+    # ===== 지도 시각화 v3.0 (이후 기존 코드 동일) =====
 
     # 경로 생성 실패 진단
     if formation_paths:
@@ -806,3 +935,29 @@ with col_right:
         st.download_button("📥 STPT CSV 다운로드", csv, "mission_stpt.csv", "text/csv")
         
         st.success(f"✅ 경로 생성 완료: 총 {len(final_in) + len(final_out)}개 웨이포인트")
+        # =========================================================
+        st.divider()
+        st.subheader("📥 AirSim 전술 데이터 송출")
+
+        if 'final_in' in st.session_state and st.session_state['final_in'] is not None:
+            path_data = st.session_state['final_in']
+            st.info(f"현재 추출 가능한 웨이포인트: {len(path_data)}개")
+
+            # 버튼을 눌러야만 파일이 실제로 생성됩니다.
+            if st.button("💾 mission_export.json 생성 (AirSim 연동용)"):
+                try:
+                    import json
+                    import os
+                    
+                    # 현재 작업 디렉토리에 저장
+                    file_path = os.path.join(os.getcwd(), "mission_export.json")
+                    
+                    with open(file_path, "w", encoding='utf-8') as f:
+                        json.dump(path_data, f)
+                    
+                    st.success(f"✅ 파일 생성 성공! 위치: {file_path}")
+                    st.balloons()  # 성공 축하 효과
+                except Exception as e:
+                    st.error(f"❌ 파일 생성 중 오류 발생: {e}")
+        else:
+            st.warning("경로 최적화를 먼저 수행하십시오. 데이터가 아직 준비되지 않았습니다.")
